@@ -15,3 +15,4 @@ else
 fi
 
 rm -f /tmp/mic-warm.pid
+rm -f /tmp/mic-warm.log

@@ -44,7 +44,7 @@ During debugging I also discovered that **Siri's Built-In Voice Trigger** (`CSBu
 
 ### Related Issue: Virtual Audio Plugins Cause Delay
 
-Third-party audio drivers from Teams, Zoom, and other conferencing apps (installed at `/Library/Audio/Plug-Ins/HAL/`) can add startup latency. If you have `MSTeamsAudioDevice.driver`, `ZoomAudioDevice.driver`, or similar, try disabling them:
+Third-party audio drivers from Teams, Zoom, and other conferencing apps (installed at `/Library/Audio/Plug-Ins/HAL/`) add significant startup latency to mic activation. Even with the keep-warm fix, these plugins can reintroduce delay. If you have `MSTeamsAudioDevice.driver`, `ZoomAudioDevice.driver`, or similar, disable them:
 
 ```bash
 sudo mv /Library/Audio/Plug-Ins/HAL/MSTeamsAudioDevice.driver /Library/Audio/Plug-Ins/HAL/MSTeamsAudioDevice.driver.disabled
@@ -56,22 +56,29 @@ Teams and Zoom still work for calls without these custom drivers.
 
 ## The Fix
 
-A single lightweight background process that holds the microphone input stream open. The mic hardware stays powered on and ready, so push-to-talk activation is always instant.
+A lightweight background process that holds the microphone input stream open. The mic hardware stays powered on and ready, so push-to-talk activation is always instant.
+
+**Automatically handles AirPods and Bluetooth switching.** When you connect or disconnect AirPods, a Bluetooth headset, or any audio device, the script detects the change and restarts the keep-warm stream on the new device within 2 seconds. No manual intervention needed.
 
 No virtual audio devices needed. No BlackHole, Loopback, or SoundFlower. Just ffmpeg reading from the mic and discarding the audio.
 
 ### How It Works
 
+The core mechanism is simple:
+
 ```
 ffmpeg -f avfoundation -i ":0" -f null /dev/null
 ```
 
-That's it. ffmpeg opens the default audio input device and sends the audio to `/dev/null` (nowhere). Nothing is recorded, stored, or transmitted. The only effect is that the microphone hardware stays awake.
+ffmpeg opens the default audio input device and sends the audio to `/dev/null` (nowhere). Nothing is recorded, stored, or transmitted. The only effect is that the microphone hardware stays awake.
+
+A monitoring loop polls the default input device every 2 seconds using `SwitchAudioSource`. When it detects a device change (e.g. AirPods connected), it kills the old ffmpeg process and starts a new one on the current device.
 
 - CPU usage: ~0%
 - Battery impact: negligible
 - Privacy: no audio is captured or stored anywhere
 - Works with: built-in mic, AirPods, Bluetooth headsets, USB mics, any input device
+- Automatic device switching: detects AirPods/Bluetooth connect and disconnect
 
 ### Note on the Orange Dot
 
@@ -81,10 +88,8 @@ macOS will show the orange microphone indicator dot in the menu bar, attributed 
 
 ### Prerequisites
 
-Install ffmpeg if you don't have it:
-
 ```bash
-brew install ffmpeg
+brew install ffmpeg switchaudio-osx
 ```
 
 ### Quick Start (Run Once)
@@ -141,7 +146,16 @@ This delay affects any push-to-talk or voice transcription app on macOS, includi
 - macOS (tested on Tahoe 26.2, likely affects Sequoia and earlier)
 - Apple Silicon Mac (M1/M2/M3/M4) - Intel Macs may also be affected
 - ffmpeg (`brew install ffmpeg`)
+- switchaudio-osx (`brew install switchaudio-osx`) for automatic device switching
 - Microphone permission for ffmpeg
+
+## Testing
+
+Run the test suite to verify all failure-recovery scenarios (device switching, ffmpeg crashes, coreaudiod restarts, etc.) using mock binaries. No real audio hardware is needed.
+
+```bash
+./test.sh
+```
 
 ## License
 
