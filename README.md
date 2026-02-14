@@ -58,8 +58,6 @@ Teams and Zoom still work for calls without these custom drivers.
 
 A lightweight native Swift binary that holds the microphone input stream open. The mic hardware stays powered on and ready, so push-to-talk activation is always instant.
 
-No Homebrew dependencies. No ffmpeg. No virtual audio devices. Just a single binary at a stable path that macOS remembers the mic permission for.
-
 ### Why native instead of ffmpeg?
 
 The previous approach used ffmpeg from Homebrew. It worked, but every `brew upgrade` moves ffmpeg to a new path (e.g. `8.0.1_2` to `8.0.1_3`). macOS TCC tracks mic permissions by binary path for unsigned binaries, so every upgrade silently breaks the mic permission. You get the push-to-talk delay back with no indication why. The native binary lives at `~/.local/bin/mic-warm` with ad-hoc code signing, so the permission grant is stable. If upgrading from the ffmpeg version, the installer handles migration automatically.
