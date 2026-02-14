@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build universal binary
+        run: swift build -c release --arch arm64 --arch x86_64
+
+      - name: Ad-hoc sign
+        run: codesign --force --sign - .build/apple/Products/Release/mic-warm
+
+      - name: Run integration tests
+        run: ./test.sh
+
+      - name: Prepare binary
+        run: cp .build/apple/Products/Release/mic-warm mic-warm
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: mic-warm
+          generate_release_notes: true

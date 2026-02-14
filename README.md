@@ -56,69 +56,50 @@ Teams and Zoom still work for calls without these custom drivers.
 
 ## The Fix
 
-A lightweight background process that holds the microphone input stream open. The mic hardware stays powered on and ready, so push-to-talk activation is always instant.
+A lightweight native Swift binary that holds the microphone input stream open. The mic hardware stays powered on and ready, so push-to-talk activation is always instant.
 
-**Automatically handles AirPods and Bluetooth switching.** When you connect or disconnect AirPods, a Bluetooth headset, or any audio device, the script detects the change and restarts the keep-warm stream on the new device within 2 seconds. No manual intervention needed.
+No Homebrew dependencies. No ffmpeg. No virtual audio devices. Just a single binary at a stable path that macOS remembers the mic permission for.
 
-No virtual audio devices needed. No BlackHole, Loopback, or SoundFlower. Just ffmpeg reading from the mic and discarding the audio.
+### Why native instead of ffmpeg?
+
+The previous approach used ffmpeg from Homebrew. It worked, but every `brew upgrade` moves ffmpeg to a new path (e.g. `8.0.1_2` to `8.0.1_3`). macOS TCC tracks mic permissions by binary path for unsigned binaries, so every upgrade silently breaks the mic permission. You get the push-to-talk delay back with no indication why. The native binary lives at `~/.local/bin/mic-warm` with ad-hoc code signing, so the permission grant is stable. If upgrading from the ffmpeg version, the installer handles migration automatically.
 
 ### How It Works
 
-The core mechanism is simple:
+`mic-warm` uses `AVCaptureSession` with an audio data output to hold the default microphone open. Audio samples are captured and immediately discarded. Nothing is recorded, stored, or transmitted. The only effect is that the microphone hardware stays awake.
 
-```
-ffmpeg -f avfoundation -i ":0" -f null /dev/null
-```
-
-ffmpeg opens the default audio input device and sends the audio to `/dev/null` (nowhere). Nothing is recorded, stored, or transmitted. The only effect is that the microphone hardware stays awake.
-
-A monitoring loop polls the default input device every 2 seconds using `SwitchAudioSource`. When it detects a device change (e.g. AirPods connected), it kills the old ffmpeg process and starts a new one on the current device.
+When you connect or disconnect AirPods, a Bluetooth headset, or any audio device, a CoreAudio property listener fires instantly and the session restarts on the new device after a 3-second debounce window (to let Bluetooth handoffs settle).
 
 - CPU usage: ~0%
 - Battery impact: negligible
 - Privacy: no audio is captured or stored anywhere
 - Works with: built-in mic, AirPods, Bluetooth headsets, USB mics, any input device
-- Automatic device switching: detects AirPods/Bluetooth connect and disconnect
+- Instant device-change detection via CoreAudio event listener (no polling)
 
 ### Note on the Orange Dot
 
-macOS will show the orange microphone indicator dot in the menu bar, attributed to "ffmpeg". This is accurate: ffmpeg has the mic open. But it's not listening to you. The audio goes straight to `/dev/null`.
+macOS will show the orange microphone indicator dot in the menu bar, attributed to "mic-warm". This is accurate: mic-warm has the mic open. But it's not listening to you. The audio goes straight to `/dev/null`.
 
 ## Installation
 
-### Prerequisites
-
 ```bash
-brew install ffmpeg switchaudio-osx
+curl -fsSL https://raw.githubusercontent.com/drewburchfield/macos-mic-keepwarm/master/install.sh | bash
 ```
 
-### Quick Start (Run Once)
-
-```bash
-chmod +x keep-mic-warm.sh
-./keep-mic-warm.sh
-```
-
-### Persistent Install (Survives Reboots)
-
-```bash
-chmod +x install.sh
-./install.sh
-```
-
-This creates a LaunchAgent that:
+This downloads a precompiled universal binary (ARM + Intel), installs it to `~/.local/bin/mic-warm`, and creates a LaunchAgent that:
 - Starts automatically on login
 - Restarts automatically if killed
 - Runs silently in the background
 
-macOS will prompt you to grant ffmpeg microphone access on first run. Click "Allow".
+macOS will prompt you to grant mic-warm microphone access. Go to System Settings > Privacy & Security > Microphone and allow it.
 
 ### Uninstall
 
 ```bash
-chmod +x uninstall.sh
-./uninstall.sh
+curl -fsSL https://raw.githubusercontent.com/drewburchfield/macos-mic-keepwarm/master/uninstall.sh | bash
 ```
+
+Or clone the repo and run `./uninstall.sh`.
 
 ## Why Don't Transcription Apps Do This?
 
@@ -143,19 +124,23 @@ This delay affects any push-to-talk or voice transcription app on macOS, includi
 
 ## System Requirements
 
-- macOS (tested on Tahoe 26.2, likely affects Sequoia and earlier)
-- Apple Silicon Mac (M1/M2/M3/M4) - Intel Macs may also be affected
-- ffmpeg (`brew install ffmpeg`)
-- switchaudio-osx (`brew install switchaudio-osx`) for automatic device switching
-- Microphone permission for ffmpeg
+- macOS 13 Ventura, 14 Sonoma, 15 Sequoia, or 26 Tahoe
+- Apple Silicon (M1/M2/M3/M4) or Intel Mac (universal binary)
+- Microphone permission for mic-warm
 
 ## Testing
 
-Run the test suite to verify all failure-recovery scenarios (device switching, ffmpeg crashes, coreaudiod restarts, etc.) using mock binaries. No real audio hardware is needed.
+Run the integration test suite to verify process lifecycle, signal handling, and PID file management:
 
 ```bash
 ./test.sh
 ```
+
+Device-switching tests require real audio hardware and should be done manually.
+
+## Legacy Shell Script
+
+The original `keep-mic-warm.sh` is kept as a fallback for systems where the native binary can't be used. It requires `ffmpeg` and `switchaudio-osx` from Homebrew. See the file header for details.
 
 ## License
 
