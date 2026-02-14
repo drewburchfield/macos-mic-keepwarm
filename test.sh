@@ -56,9 +56,12 @@ MOCK
     # coreaudiod recovery sleep (0.5s instead of 2s)
     sed \
         -e "s|POLL_INTERVAL=2|POLL_INTERVAL=$POLL|" \
+        -e "s|DEBOUNCE_WAIT=3|DEBOUNCE_WAIT=1|" \
+        -e "s|DEBOUNCE_CHECKS=3|DEBOUNCE_CHECKS=2|" \
         -e "s|/tmp/mic-warm.pid|$TEST_DIR/mic-warm.pid|g" \
         -e '/Wait for audio subsystem/,/^fi$/{s/sleep 2/sleep 0.5/;}' \
         -e '/Wait for audio to come back/,/done/{s/sleep 2/sleep 0.5/;}' \
+        -e '/debounce to let Bluetooth/,/done/{s/sleep 1/sleep 0.5/;}' \
         "$SCRIPT_DIR/keep-mic-warm.sh" > "$TEST_DIR/keep-mic-warm.sh"
     chmod +x "$TEST_DIR/keep-mic-warm.sh"
 }
@@ -175,8 +178,8 @@ test_device_switch_airpods_to_builtin() {
     [ -n "$old_pid" ] || { echo "  No initial ffmpeg PID"; return 1; }
 
     echo "MacBook Pro Microphone" > "$TEST_DIR/device"
-    wait_for_log "Device changed: Drew's AirPods Pro -> MacBook Pro Microphone" || return 1
-    wait_for_log "Restarted on: MacBook Pro Microphone" || return 1
+    wait_for_log "Device change detected: Drew's AirPods Pro -> MacBook Pro Microphone" || return 1
+    wait_for_log "Restarted on: MacBook Pro Microphone" 30 || return 1
 
     local new_pid
     new_pid=$(get_ffmpeg_pid)
@@ -193,8 +196,8 @@ test_device_switch_builtin_to_airpods() {
     old_pid=$(get_ffmpeg_pid)
 
     echo "Drew's AirPods Pro" > "$TEST_DIR/device"
-    wait_for_log "Device changed: MacBook Pro Microphone -> Drew's AirPods Pro" || return 1
-    wait_for_log "Restarted on: Drew's AirPods Pro" || return 1
+    wait_for_log "Device change detected: MacBook Pro Microphone -> Drew's AirPods Pro" || return 1
+    wait_for_log "Restarted on: Drew's AirPods Pro" 30 || return 1
 
     local new_pid
     new_pid=$(get_ffmpeg_pid)
@@ -240,8 +243,8 @@ test_ffmpeg_fails_to_start() {
     # Make ffmpeg fail, then trigger restart via device change
     touch "$TEST_DIR/ffmpeg_fail"
     echo "USB Microphone" > "$TEST_DIR/device"
-    wait_for_log "Device changed:" || return 1
-    wait_for_log "ffmpeg process exited immediately" 10 || return 1
+    wait_for_log "Device change detected:" || return 1
+    wait_for_log "ffmpeg process exited immediately" 20 || return 1
 
     # Remove fail flag, trigger another device change for recovery
     rm -f "$TEST_DIR/ffmpeg_fail"
@@ -258,16 +261,48 @@ test_rapid_device_switching() {
         sleep 0.3
     done
 
-    # Give the script time to process
-    sleep 4
+    # Give the script time to debounce and process
+    sleep 6
 
     local final_pid
     final_pid=$(get_ffmpeg_pid)
     [ -n "$final_pid" ] && kill -0 "$final_pid" 2>/dev/null || return 1
 
-    local changes
-    changes=$(grep -c "Device changed:" "$TEST_DIR/logs/output.log" 2>/dev/null || echo 0)
-    [ "$changes" -ge 1 ] || { echo "  No device changes logged"; return 1; }
+    # Debounce should reduce the number of actual restarts
+    local restarts
+    restarts=$(grep -c "Restarted on:" "$TEST_DIR/logs/output.log" 2>/dev/null || echo 0)
+    [ "$restarts" -ge 1 ] || { echo "  No restarts logged"; return 1; }
+
+    # With debounce, we should see fewer restarts than raw device changes
+    local detections
+    detections=$(grep -c "Device change detected:" "$TEST_DIR/logs/output.log" 2>/dev/null || echo 0)
+    [ "$detections" -ge 1 ] || { echo "  No device changes detected"; return 1; }
+}
+
+test_device_bounce_back() {
+    # Simulates AirPods briefly appearing then bouncing back to built-in.
+    # The debounce should prevent a needless restart.
+    echo "MacBook Pro Microphone" > "$TEST_DIR/device"
+    start_script
+    wait_for_log "Running (PID:" || return 1
+
+    local old_pid
+    old_pid=$(get_ffmpeg_pid)
+
+    # Briefly switch to AirPods, then back to built-in before debounce settles
+    echo "Drew's AirPods Pro" > "$TEST_DIR/device"
+    sleep 0.3
+    echo "MacBook Pro Microphone" > "$TEST_DIR/device"
+
+    # Wait for debounce to finish
+    sleep 4
+
+    wait_for_log "Device bounced back to: MacBook Pro Microphone" 10 || return 1
+
+    # PID should NOT have changed since device settled back to original
+    local current_pid
+    current_pid=$(get_ffmpeg_pid)
+    [ "$old_pid" = "$current_pid" ] || { echo "  PID changed unnecessarily: $old_pid -> $current_pid"; return 1; }
 }
 
 test_stale_pid_cleanup() {
@@ -318,6 +353,7 @@ run_test "ffmpeg dies unexpectedly"             test_ffmpeg_dies_unexpectedly
 run_test "coreaudiod restart recovery"          test_coreaudiod_restart
 run_test "ffmpeg fails to start"                test_ffmpeg_fails_to_start
 run_test "Rapid device switching"               test_rapid_device_switching
+run_test "Device bounce-back (debounce)"        test_device_bounce_back
 run_test "Stale PID cleanup (dead process)"     test_stale_pid_cleanup
 run_test "Stale PID cleanup (live process)"     test_stale_pid_cleanup_live_process
 

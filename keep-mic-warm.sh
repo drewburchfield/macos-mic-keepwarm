@@ -5,6 +5,8 @@
 # and restarts the keep-warm stream on the new device.
 
 POLL_INTERVAL=2
+DEBOUNCE_WAIT=3    # seconds to wait for device to settle after a change
+DEBOUNCE_CHECKS=3  # re-check this many times during debounce
 
 log() {
     echo "[$(date '+%H:%M:%S')] $1"
@@ -150,16 +152,36 @@ while true; do
         continue
     fi
 
-    # Device changed
+    # Device changed - debounce to let Bluetooth handoffs settle
     if [ "$NEW_DEVICE" != "$CURRENT_DEVICE" ]; then
-        log "Device changed: $CURRENT_DEVICE -> $NEW_DEVICE"
-        CURRENT_DEVICE="$NEW_DEVICE"
-        if start_ffmpeg; then
-            log "Restarted on: $CURRENT_DEVICE (PID: $FFMPEG_PID)"
-            FAIL_COUNT=0
+        log "Device change detected: $CURRENT_DEVICE -> $NEW_DEVICE (waiting ${DEBOUNCE_WAIT}s to settle)"
+        SETTLED_DEVICE="$NEW_DEVICE"
+        for i in $(seq 1 "$DEBOUNCE_CHECKS"); do
+            sleep 1
+            SETTLED_DEVICE=$(get_device)
+            if [ -z "$SETTLED_DEVICE" ]; then
+                SETTLED_DEVICE=""
+                break
+            fi
+        done
+        # If device went offline during debounce, let the next loop iteration handle it
+        if [ -z "$SETTLED_DEVICE" ]; then
+            log "Device went offline during handoff. Waiting for recovery..."
+            continue
+        fi
+        # Only switch if the settled device differs from what we're currently on
+        if [ "$SETTLED_DEVICE" != "$CURRENT_DEVICE" ]; then
+            log "Device settled on: $SETTLED_DEVICE (was: $CURRENT_DEVICE)"
+            CURRENT_DEVICE="$SETTLED_DEVICE"
+            if start_ffmpeg; then
+                log "Restarted on: $CURRENT_DEVICE (PID: $FFMPEG_PID)"
+                FAIL_COUNT=0
+            else
+                log "Warning: ffmpeg failed to start on $CURRENT_DEVICE"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
         else
-            log "Warning: ffmpeg failed to start on $CURRENT_DEVICE"
-            FAIL_COUNT=$((FAIL_COUNT + 1))
+            log "Device bounced back to: $CURRENT_DEVICE (no restart needed)"
         fi
         continue
     fi
