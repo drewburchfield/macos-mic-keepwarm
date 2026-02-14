@@ -2,7 +2,7 @@
 
 Fix the 2-5 second push-to-talk activation delay on macOS.
 
-If you use voice transcription apps like SuperWhisper, WhisperFlow, Wispr Flow, or any push-to-talk tool and experience a delay before recording starts, especially with AirPods or Bluetooth audio, this is for you.
+If you use voice transcription apps like SuperWhisper, WhisperFlow, Wispr Flow, macOS Dictation, or any push-to-talk tool and experience a delay before recording starts, especially with AirPods or Bluetooth audio, this is for you.
 
 ## The Problem
 
@@ -44,7 +44,7 @@ During debugging I also discovered that **Siri's Built-In Voice Trigger** (`CSBu
 
 ### Related Issue: Virtual Audio Plugins Cause Delay
 
-Third-party audio drivers from Teams, Zoom, and other conferencing apps (installed at `/Library/Audio/Plug-Ins/HAL/`) add significant startup latency to mic activation. Even with the keep-warm fix, these plugins can reintroduce delay. If you have `MSTeamsAudioDevice.driver`, `ZoomAudioDevice.driver`, or similar, disable them:
+Third-party audio drivers from Teams, Zoom, and other conferencing apps (installed at `/Library/Audio/Plug-Ins/HAL/`) add significant startup latency to mic activation and cause `coreaudiod` to consume excessive CPU even when idle (measured at 36.8% CPU with plugins enabled, 0.0% after disabling). Even with the keep-warm fix, these plugins can reintroduce delay. If you have `MSTeamsAudioDevice.driver`, `ZoomAudioDevice.driver`, or similar, disable them:
 
 ```bash
 sudo mv /Library/Audio/Plug-Ins/HAL/MSTeamsAudioDevice.driver /Library/Audio/Plug-Ins/HAL/MSTeamsAudioDevice.driver.disabled
@@ -74,10 +74,6 @@ When you connect or disconnect AirPods, a Bluetooth headset, or any audio device
 - Works with: built-in mic, AirPods, Bluetooth headsets, USB mics, any input device
 - Instant device-change detection via CoreAudio event listener (no polling)
 
-### Note on the Orange Dot
-
-macOS will show the orange microphone indicator dot in the menu bar, attributed to "mic-warm". This is accurate: mic-warm has the mic open. But it's not listening to you. Audio samples are captured and immediately discarded.
-
 ## Installation
 
 ```bash
@@ -99,26 +95,17 @@ curl -fsSL https://raw.githubusercontent.com/drewburchfield/macos-mic-keepwarm/m
 
 Or clone the repo and run `./uninstall.sh`.
 
-## Why Don't Transcription Apps Do This?
+## The Orange Dot
 
-They should. SuperWhisper's own changelog acknowledges "handling push to talk shortcut if microphone is slow to start." The correct engineering solution is to keep the audio input stream open between recordings and use a ring buffer with lookback. When the user presses push-to-talk, start reading from the buffer, including audio captured just before the keypress.
+macOS will show the orange microphone indicator dot in the menu bar, attributed to "mic-warm". This is accurate: mic-warm has the mic open. But it's not listening to you. Audio samples are captured and immediately discarded.
 
-The likely reason they don't: the orange microphone indicator dot. Apps don't want users seeing "SuperWhisper is using your microphone" 24/7, even though the alternative is a broken user experience.
+This is the same reason transcription apps don't solve this themselves. They should. SuperWhisper's own changelog acknowledges "handling push to talk shortcut if microphone is slow to start." The correct engineering solution is to keep the audio input stream open between recordings and use a ring buffer with lookback. When the user presses push-to-talk, start reading from the buffer, including audio captured just before the keypress. But apps don't want users seeing "SuperWhisper is using your microphone" 24/7, even though the alternative is a broken user experience.
 
-Apple could fix this by providing a fast-wake API or a low-power standby mode for the mic hardware. As of macOS Tahoe 26.2, no such API exists.
+Apple could fix this by providing a fast-wake API or a low-power standby mode for the mic hardware that doesn't trigger the orange dot. As of macOS Tahoe 26.2, no such API exists.
 
 ## Why Not Use BlackHole or a Virtual Audio Device?
 
 You don't need one. BlackHole, Loopback, and SoundFlower create virtual audio routing devices, which adds complexity and can introduce their own latency and compatibility issues. This fix works directly with your real microphone hardware. It's simpler and has fewer things that can break.
-
-## Affected Apps
-
-This delay affects any push-to-talk or voice transcription app on macOS, including but not limited to:
-- SuperWhisper
-- WhisperFlow
-- Wispr Flow
-- macOS Dictation
-- Any app that activates the microphone on-demand rather than continuously
 
 ## System Requirements
 
