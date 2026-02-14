@@ -1,6 +1,6 @@
 #!/bin/bash
 # uninstall.sh
-# Removes the keep-mic-warm background service.
+# Removes the mic-warm background service.
 
 set -e
 
@@ -11,7 +11,7 @@ if [ -f "$PLIST_PATH" ]; then
     rm -f "$PLIST_PATH"
     echo "Uninstalled. Mic will return to default sleep behavior."
 else
-    echo "Keep-mic-warm is not installed (no plist found)."
+    echo "mic-warm is not installed (no plist found)."
 fi
 
 rm -f /tmp/mic-warm.pid

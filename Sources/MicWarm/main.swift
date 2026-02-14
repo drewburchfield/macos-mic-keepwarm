@@ -171,7 +171,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         }
     }
 
-    /// Signal-safe shutdown: only calls POSIX functions (no Swift/Foundation APIs).
+    /// Signal-safe shutdown: cleans up PID file and stops the session.
+    /// Called from @convention(c) signal handler, followed immediately by _exit(0).
     func signalShutdown() {
         session?.stopRunning()
         session = nil

@@ -76,7 +76,7 @@ When you connect or disconnect AirPods, a Bluetooth headset, or any audio device
 
 ### Note on the Orange Dot
 
-macOS will show the orange microphone indicator dot in the menu bar, attributed to "mic-warm". This is accurate: mic-warm has the mic open. But it's not listening to you. The audio goes straight to `/dev/null`.
+macOS will show the orange microphone indicator dot in the menu bar, attributed to "mic-warm". This is accurate: mic-warm has the mic open. But it's not listening to you. Audio samples are captured and immediately discarded.
 
 ## Installation
 
