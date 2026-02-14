@@ -1,34 +1,40 @@
 #!/bin/bash
 # install.sh
-# Installs keep-mic-warm as a persistent background service (LaunchAgent).
-# Runs on login, restarts automatically if killed.
-# Auto-detects audio device changes (AirPods connect/disconnect).
+# Downloads and installs mic-warm as a persistent background service (LaunchAgent).
+# No Homebrew dependencies required.
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT_PATH="$SCRIPT_DIR/keep-mic-warm.sh"
-
-if [ ! -f "$SCRIPT_PATH" ]; then
-    echo "Error: keep-mic-warm.sh not found at $SCRIPT_PATH"
-    exit 1
-fi
-
-if ! command -v ffmpeg &>/dev/null; then
-    echo "Error: ffmpeg is required. Install with: brew install ffmpeg"
-    exit 1
-fi
-
-if ! command -v SwitchAudioSource &>/dev/null; then
-    echo "SwitchAudioSource not found. Installing..."
-    brew install switchaudio-osx
-fi
-
-chmod +x "$SCRIPT_PATH"
-
+REPO="drewburchfield/macos-mic-keepwarm"
+BIN_DIR="$HOME/.local/bin"
+BIN_PATH="$BIN_DIR/mic-warm"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.user.keep-mic-warm.plist"
 
-# Unload existing if present
+echo "Installing mic-warm..."
+
+# Migrate from old ffmpeg-based method if present
+if [ -f "$PLIST_PATH" ] && grep -q "keep-mic-warm.sh" "$PLIST_PATH" 2>/dev/null; then
+    echo "Migrating from legacy shell script..."
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    # Kill any leftover ffmpeg from the old method
+    if [ -f /tmp/mic-warm.pid ]; then
+        OLD_PID=$(cat /tmp/mic-warm.pid 2>/dev/null || true)
+        [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
+    fi
+    pkill -f "ffmpeg.*avfoundation.*:0.*null" 2>/dev/null || true
+    rm -f /tmp/mic-warm.pid /tmp/mic-warm.log
+    echo "Old method stopped."
+fi
+
+# Download precompiled universal binary from latest release
+mkdir -p "$BIN_DIR"
+curl -fsSL "https://github.com/$REPO/releases/latest/download/mic-warm" -o "$BIN_PATH"
+chmod +x "$BIN_PATH"
+
+# Ad-hoc code sign so macOS TCC tracks a stable identity
+codesign --force --sign - "$BIN_PATH"
+
+# Unload existing agent if present
 launchctl unload "$PLIST_PATH" 2>/dev/null || true
 
 cat > "$PLIST_PATH" << EOF
@@ -40,8 +46,7 @@ cat > "$PLIST_PATH" << EOF
     <string>com.user.keep-mic-warm</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>${SCRIPT_PATH}</string>
+        <string>${BIN_PATH}</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -51,23 +56,18 @@ cat > "$PLIST_PATH" << EOF
     <string>/tmp/mic-warm.log</string>
     <key>StandardOutPath</key>
     <string>/tmp/mic-warm.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    </dict>
 </dict>
 </plist>
 EOF
 
 launchctl load "$PLIST_PATH"
 
+echo ""
 echo "Installed and running."
 echo "The mic will stay warm across reboots."
-echo "Automatically switches when you connect/disconnect AirPods or Bluetooth audio."
 echo ""
-echo "macOS will ask you to grant ffmpeg microphone access on first run."
-echo "Click 'Allow' when prompted."
+echo "macOS will prompt you to grant mic-warm microphone access."
+echo "Go to System Settings > Privacy & Security > Microphone and allow it."
 echo ""
 echo "Log file: /tmp/mic-warm.log"
 echo "To uninstall: ./uninstall.sh"

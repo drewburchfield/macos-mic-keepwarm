@@ -16,3 +16,8 @@ fi
 
 rm -f /tmp/mic-warm.pid
 rm -f /tmp/mic-warm.log
+
+if [ -f "$HOME/.local/bin/mic-warm" ]; then
+    rm -f "$HOME/.local/bin/mic-warm"
+    echo "Removed mic-warm binary."
+fi

@@ -1,5 +1,9 @@
 #!/bin/bash
 # keep-mic-warm.sh
+# LEGACY FALLBACK - Use the native mic-warm binary instead (see README.md).
+# This script requires ffmpeg and SwitchAudioSource from Homebrew, and mic
+# permissions break on every brew upgrade because ffmpeg moves to a new path.
+#
 # Prevents macOS from sleeping the microphone hardware between uses.
 # Automatically detects audio device changes (e.g. AirPods connect/disconnect)
 # and restarts the keep-warm stream on the new device.
