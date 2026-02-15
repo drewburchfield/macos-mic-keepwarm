@@ -9,7 +9,7 @@ import Foundation
 // log() is called from both main and background threads (stopRunning watchdog).
 let logDateFormatter: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
-    f.formatOptions = [.withTime, .withFractionalSeconds]
+    f.formatOptions = [.withTime, .withColonSeparatorInTime, .withFractionalSeconds]
     f.timeZone = .current
     return f
 }()
