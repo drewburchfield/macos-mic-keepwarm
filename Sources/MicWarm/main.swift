@@ -117,8 +117,12 @@ func logAllDevices(prefix: String) {
 let pidPath = "/tmp/mic-warm.pid"
 
 func writePID() {
-    try? "\(ProcessInfo.processInfo.processIdentifier)".write(
-        toFile: pidPath, atomically: true, encoding: .utf8)
+    do {
+        try "\(ProcessInfo.processInfo.processIdentifier)".write(
+            toFile: pidPath, atomically: true, encoding: .utf8)
+    } catch {
+        log("Warning: Could not write PID file \(pidPath): \(error.localizedDescription)")
+    }
 }
 
 func cleanupPID() {
@@ -191,7 +195,9 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             let oldSid = sessionID
             let oldSamples = sampleCount
             log("[session-\(oldSid)] Stopping old session (samples received: \(oldSamples))")
+            #if false // Enable for instrumented debugging
             old.removeObserver(self, forKeyPath: "running")
+            #endif
             // Stop the old session on a background thread. stopRunning() can deadlock
             // if the session's Bluetooth device has already disconnected (CoreAudio hangs
             // in AudioObjectRemovePropertyListener waiting on a dead device).
@@ -199,6 +205,12 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                 log("[session-\(oldSid)] Background: stopping old session...")
                 old.stopRunning()
                 log("[session-\(oldSid)] Background: old session stopped")
+            }
+            // Watchdog: warn if stopRunning() hangs (likely deadlocked on dead device)
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10.0) { [weak old] in
+                if let old, old.isRunning {
+                    log("[session-\(oldSid)] WARNING: stopRunning() did not complete in 10s (likely deadlocked on dead Bluetooth device)")
+                }
             }
         }
         session = nil
@@ -216,15 +228,9 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         }
 
         // Get CoreAudio device ID for this AVCaptureDevice
-        let allDevices = getAllAudioDeviceIDs()
-        let deviceUID = device.uniqueID
-        currentDeviceID = 0
-        for d in allDevices {
-            if getStringProperty(d, selector: kAudioDevicePropertyDeviceUID) == deviceUID {
-                currentDeviceID = d
-                break
-            }
-        }
+        currentDeviceID = getAllAudioDeviceIDs().first {
+            getStringProperty($0, selector: kAudioDevicePropertyDeviceUID) == device.uniqueID
+        } ?? 0
 
         log("[session-\(sid)] Opening device: \(device.localizedName) [id=\(currentDeviceID)]")
 
@@ -242,8 +248,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         }
 
         let output = AVCaptureAudioDataOutput()
-        let queue = DispatchQueue(label: "mic-warm.audio", qos: .userInitiated)
-        output.setSampleBufferDelegate(self, queue: queue)
+        output.setSampleBufferDelegate(self, queue: .main)
         s.addOutput(output)
 
         log("[session-\(sid)] Starting session...")
@@ -301,7 +306,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 5.0, repeating: 5.0)
         timer.setEventHandler { [weak self] in
-            guard let self else { return }
+            guard let self, self.sessionID == sid else { return }
             let delta = self.sampleCount - self.lastHeartbeatSampleCount
             let running = self.session?.isRunning ?? false
             let gap = self.lastSampleTime.map { Date().timeIntervalSince($0) } ?? -1
@@ -377,6 +382,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             self.debouncedRestart(reason: "default input device changed (new: \(currentDevice?.localizedName ?? "nil"))")
         }
 
+        #if false // Enable for instrumented debugging
         // Device list changes (additions/removals)
         var devicesAddr = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
@@ -385,10 +391,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &devicesAddr, DispatchQueue.main
         ) { _, _ in
-            #if false // Enable for instrumented debugging
             log("[system] *** Device list changed")
             logAllDevices(prefix: "[system]")
-            #endif
         }
 
         // Default output device changes (relevant for Bluetooth mode switching)
@@ -399,15 +403,14 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject), &outputAddr, DispatchQueue.main
         ) { _, _ in
-            #if false // Enable for instrumented debugging
             let outputID: AudioDeviceID? = getAudioProperty(
                 AudioObjectID(kAudioObjectSystemObject),
                 selector: kAudioHardwarePropertyDefaultOutputDevice)
             if let oid = outputID {
                 log("[system] Default output device changed -> \(describeDevice(oid))")
             }
-            #endif
         }
+        #endif
     }
 
     #if false // Enable for instrumented debugging
@@ -591,7 +594,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     }
 
     func signalShutdown() {
-        session?.stopRunning()
+        // Skip stopRunning() here: it can deadlock on Bluetooth devices, and
+        // _exit(0) follows immediately so the OS reclaims all resources.
         session = nil
         cleanupPID()
     }
