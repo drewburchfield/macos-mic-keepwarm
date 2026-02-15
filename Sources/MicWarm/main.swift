@@ -5,9 +5,12 @@ import Foundation
 
 // MARK: - Logging
 
-let logDateFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "HH:mm:ss.SSS"
+// ISO8601DateFormatter is thread-safe, unlike DateFormatter.
+// log() is called from both main and background threads (stopRunning watchdog).
+let logDateFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withTime, .withFractionalSeconds]
+    f.timeZone = .current
     return f
 }()
 
@@ -202,6 +205,13 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             #if false // Enable for instrumented debugging
             old.removeObserver(self, forKeyPath: "running")
             #endif
+            // Disconnect the old session's sample buffer delegate immediately so stale
+            // callbacks don't increment the new session's sampleCount.
+            for output in old.outputs {
+                if let audioOutput = output as? AVCaptureAudioDataOutput {
+                    audioOutput.setSampleBufferDelegate(nil, queue: nil)
+                }
+            }
             // Stop the old session on a background thread. stopRunning() can deadlock
             // if the session's Bluetooth device has already disconnected (CoreAudio hangs
             // in AudioObjectRemovePropertyListener waiting on a dead device).
