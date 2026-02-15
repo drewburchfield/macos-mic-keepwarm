@@ -191,6 +191,10 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     // Start (or restart) the capture session on the current default mic.
     @discardableResult
     func startSession() -> Bool {
+        // Cancel any pending debounced restart (e.g. if auto-recovery fires first)
+        debounceWork?.cancel()
+        debounceWork = nil
+
         if let old = session {
             let oldSid = sessionID
             let oldSamples = sampleCount
@@ -603,7 +607,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     func shutdown() {
         debounceWork?.cancel()
         stopHeartbeat()
-        session?.stopRunning()
+        // Skip stopRunning(): it can deadlock on Bluetooth devices.
+        // Process exit reclaims all resources.
         session = nil
         cleanupPID()
         log("Shutdown complete")
