@@ -1,5 +1,7 @@
 # macos-mic-keepwarm
 
+[![Apple Feedback](https://img.shields.io/badge/Apple_Feedback-Submitted_Feb_2026-orange)](APPLE_FEEDBACK.md)
+
 Fix the 2-5 second push-to-talk activation delay on macOS.
 
 If you use voice transcription apps like SuperWhisper, WhisperFlow, Wispr Flow, macOS Dictation, or any push-to-talk tool and experience a delay before recording starts, especially with AirPods or Bluetooth audio, this is for you.
