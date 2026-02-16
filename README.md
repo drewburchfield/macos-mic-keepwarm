@@ -1,4 +1,4 @@
-# <img src="assets/campfire.png" width="32" align="top"> macos-mic-keepwarm
+# <img src="assets/campfire.png" width="40" style="vertical-align: middle; margin-bottom: -4px;"> macos-mic-keepwarm
 
 [![Apple Feedback](https://img.shields.io/badge/Apple_Feedback-Submitted_Feb_2026-orange)](APPLE_FEEDBACK.md)
 
