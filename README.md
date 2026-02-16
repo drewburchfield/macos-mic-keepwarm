@@ -6,15 +6,13 @@ If you use voice transcription apps like SuperWhisper, WhisperFlow, Wispr Flow, 
 
 ## The Problem
 
-macOS aggressively power-manages the microphone hardware on Apple Silicon Macs (M1/M2/M3/M4). When no app is actively using the mic, the hardware goes to sleep. The next time a push-to-talk app tries to record, it has to wake the mic hardware first, causing a 2-5 second delay.
+Two things cause the push-to-talk delay on Apple Silicon Macs (M1/M2/M3/M4):
 
-This means:
-- You press your push-to-talk key and start talking
-- The first 2-5 seconds of speech are lost or the app appears frozen
-- If you use it again quickly (within ~30-60 seconds), it's instant
-- Wait a minute, and the delay is back
+**1. Microphone hardware sleep.** When no app is actively using the mic, macOS powers down the hardware. The next capture start takes 2-5 seconds before audio samples arrive. If you use the mic again within ~30 seconds, it's instant. Wait a minute, and the delay is back.
 
-This is especially bad with AirPods and Bluetooth headsets, where the audio routing adds even more wake-up latency.
+**2. Bluetooth device switching.** When AirPods or a Bluetooth headset become the active input device (connecting, reconnecting, or switching from built-in mic), Bluetooth SCO channel negotiation adds 1-3 seconds of delay regardless of whether the mic was idle. This happens on every device switch.
+
+These compound: if the mic was idle AND a Bluetooth switch occurs, both delays stack (3-5+ seconds). The result is the first 2-5 seconds of speech lost every time you press push-to-talk after the mic has been quiet.
 
 ## What I Tried (So You Don't Have To)
 
@@ -64,15 +62,18 @@ The previous approach used ffmpeg from Homebrew. It worked, but every `brew upgr
 
 ### How It Works
 
-`mic-warm` uses `AVCaptureSession` with an audio data output to hold the default microphone open. Audio samples are captured and immediately discarded. Nothing is recorded, stored, or transmitted. The only effect is that the microphone hardware stays awake.
+`mic-warm` uses `AVCaptureSession` with an audio data output to hold the default microphone open. Audio samples are captured and immediately discarded. Nothing is recorded, stored, or transmitted. The only effect is that the microphone hardware stays awake and the Bluetooth audio channel stays negotiated.
 
 When you connect or disconnect AirPods, a Bluetooth headset, or any audio device, a CoreAudio property listener fires instantly and the session restarts on the new device after a 3-second debounce window (to let Bluetooth handoffs settle).
+
+**Bluetooth resilience:** When AirPods disconnect, `AVCaptureSession.stopRunning()` can deadlock because CoreAudio's `HALB_Guard` waits on a condition variable for the now-dead Bluetooth device. mic-warm handles this by tearing down the audio pipeline first (releasing the CMIO semaphore that coreaudiod depends on), then dispatching `stopRunning()` to a background thread so a hung Bluetooth teardown is a leaked thread, not a frozen process. A heartbeat timer detects stalled or zero-sample sessions and automatically restarts them.
 
 - CPU usage: ~0%
 - Battery impact: negligible
 - Privacy: no audio is captured or stored anywhere
 - Works with: built-in mic, AirPods, Bluetooth headsets, USB mics, any input device
 - Instant device-change detection via CoreAudio event listener (no polling)
+- Auto-recovery from Bluetooth disconnects, coreaudiod restarts, and stalled sessions
 
 ## Installation
 

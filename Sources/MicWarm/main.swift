@@ -205,16 +205,23 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             #if false // Enable for instrumented debugging
             old.removeObserver(self, forKeyPath: "running")
             #endif
-            // Disconnect the old session's sample buffer delegate immediately so stale
-            // callbacks don't increment the new session's sampleCount.
+            // Tear down the audio pipeline on the main thread before dispatching
+            // stopRunning(). The CMIO graph holds a semaphore that coreaudiod's
+            // AudioDeviceManager thread waits on; removing inputs/outputs releases
+            // that graph and frees the semaphore, reducing the chance that a
+            // background stopRunning() deadlocks on a disconnected Bluetooth device.
             for output in old.outputs {
                 if let audioOutput = output as? AVCaptureAudioDataOutput {
                     audioOutput.setSampleBufferDelegate(nil, queue: nil)
                 }
+                old.removeOutput(output)
             }
-            // Stop the old session on a background thread. stopRunning() can deadlock
-            // if the session's Bluetooth device has already disconnected (CoreAudio hangs
-            // in AudioObjectRemovePropertyListener waiting on a dead device).
+            for input in old.inputs {
+                old.removeInput(input)
+            }
+            // Stop the old session on a background thread. Even with inputs/outputs
+            // removed, stopRunning() can still hang if CoreAudio's HALB_Guard is
+            // waiting on a condition variable for the dead Bluetooth device.
             DispatchQueue.global(qos: .utility).async {
                 log("[session-\(oldSid)] Background: stopping old session...")
                 old.stopRunning()
