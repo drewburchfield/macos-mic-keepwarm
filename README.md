@@ -76,6 +76,7 @@ When you connect or disconnect AirPods, a Bluetooth headset, or any audio device
 - Works with: built-in mic, AirPods, Bluetooth headsets, USB mics, any input device
 - Instant device-change detection via CoreAudio event listener (no polling)
 - Auto-recovery from Bluetooth disconnects, coreaudiod restarts, and stalled sessions
+- **Bluetooth audio note:** holding the mic open on AirPods/Bluetooth keeps the connection in SCO (telephony) mode, which slightly reduces output audio quality. This is a Bluetooth protocol limitation, not specific to mic-warm. Any app using the mic causes the same behavior.
 
 ## Installation
 
@@ -89,6 +90,10 @@ This downloads a precompiled universal binary (ARM + Intel), installs it to `~/.
 - Runs silently in the background
 
 macOS will prompt you to grant mic-warm microphone access. Go to System Settings > Privacy & Security > Microphone and allow it.
+
+### Upgrade
+
+To upgrade, re-run the install command. The script re-signs the binary and reloads the LaunchAgent. Don't replace the binary manually, as macOS tracks microphone permissions by code signature and will silently reject an unsigned replacement.
 
 ### Uninstall
 
