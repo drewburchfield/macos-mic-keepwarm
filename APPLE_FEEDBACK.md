@@ -6,6 +6,7 @@ This documents a formal bug report and API request submitted to Apple through Fe
 
 | Field | Detail |
 |-------|--------|
+| **Feedback ID** | FB21969131 |
 | **Status** | Submitted |
 | **Date** | February 16, 2026 |
 | **Category** | macOS > Audio |
