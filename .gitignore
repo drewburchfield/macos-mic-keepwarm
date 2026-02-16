@@ -1,2 +1,5 @@
 .build/
 .swiftpm/
+.DS_Store
+diagnostics/
+apple-feedback-draft.md
