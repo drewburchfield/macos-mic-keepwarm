@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CoreAudio
 import Darwin
@@ -6,7 +7,7 @@ import Foundation
 // MARK: - Logging
 
 // ISO8601DateFormatter is thread-safe, unlike DateFormatter.
-// log() is called from both main and background threads (stopRunning watchdog).
+// log() is called from multiple queues.
 let logDateFormatter: ISO8601DateFormatter = {
     let f = ISO8601DateFormatter()
     f.formatOptions = [.withTime, .withColonSeparatorInTime, .withFractionalSeconds]
@@ -145,39 +146,67 @@ func killStalePID() {
     cleanupPID()
 }
 
+// MARK: - Per-device listener tracking
+
+struct ListenerRegistration {
+    let deviceID: AudioObjectID
+    var address: AudioObjectPropertyAddress
+    let block: AudioObjectPropertyListenerBlock
+}
+
 // MARK: - Capture session
 
 class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+
+    // --- Queues ---
+    // Session lifecycle: create, teardown, configure, restart. Never use main for these.
+    private let sessionQueue = DispatchQueue(label: "com.micwarm.session")
+    // Sample buffer delivery and heartbeat. Confines all sample counting state.
+    private let sampleQueue = DispatchQueue(label: "com.micwarm.samples", qos: .userInteractive)
+    // CoreAudio per-device listener callbacks. Isolated from both main and session queues.
+    private let listenerQueue = DispatchQueue(label: "com.micwarm.listeners")
+
+    // --- Session state (confined to sessionQueue) ---
     private var session: AVCaptureSession?
     private var debounceWork: DispatchWorkItem?
     private let debounceSeconds: Double = 3.0
     private var listenersInstalled = false
-
-    private var sampleCount: UInt64 = 0
-    private var lastSampleTime: Date?
-    private var sessionStartTime: Date?
-    private var heartbeatTimer: DispatchSourceTimer?
-    private var lastHeartbeatSampleCount: UInt64 = 0
     private var sessionID: UInt32 = 0
     private var currentDeviceID: AudioDeviceID = 0
+    private var sessionStartTime: Date?
+    private var consecutiveZeroSampleRestarts: Int = 0
+
+    // --- Sample state (confined to sampleQueue) ---
+    private var sampleCount: UInt64 = 0
+    private var lastSampleTime: Date?
+    private var lastHeartbeatSampleCount: UInt64 = 0
+    private var heartbeatTimer: DispatchSourceTimer?
+    // Silent-sample tracking: detects "signal goes flat" (samples flow but contain silence)
+    private var silentSampleCount: UInt64 = 0
+    private var lastSilentSampleCount: UInt64 = 0
+    private var silentStreakStart: Date?
+
+    // --- Listener tracking (confined to listenerQueue) ---
+    private var perDeviceListeners: [ListenerRegistration] = []
+
+    // MARK: - Startup
 
     func start() {
         killStalePID()
         writePID()
 
-        #if false // Enable for instrumented debugging
         log("=== STARTUP DEVICE SNAPSHOT ===")
         logAllDevices(prefix: "[startup]")
         log("=== END STARTUP SNAPSHOT ===")
-        #endif
 
-        guard startSession() else {
-            log("Error: No audio input device found. Waiting for recovery...")
-            scheduleRecovery()
-            return
+        sessionQueue.async { [self] in
+            guard startSession_onSessionQueue() else {
+                log("Error: No audio input device found. Waiting for recovery...")
+                scheduleRecovery_onSessionQueue()
+                return
+            }
+            installListenersOnce()
         }
-
-        installListenersOnce()
     }
 
     private func installListenersOnce() {
@@ -185,60 +214,67 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         listenersInstalled = true
         installDeviceListener()
         installConnectionObservers()
-        #if false // Enable for instrumented debugging
         installPerDeviceListeners()
-        #endif
         log("[listeners] All system listeners installed")
     }
 
+    // MARK: - Session lifecycle (all on sessionQueue)
+
     // Start (or restart) the capture session on the current default mic.
+    // MUST be called on sessionQueue.
     @discardableResult
-    func startSession() -> Bool {
-        // Cancel any pending debounced restart (e.g. if auto-recovery fires first)
+    private func startSession_onSessionQueue() -> Bool {
+        // Cancel any pending debounced restart
         debounceWork?.cancel()
         debounceWork = nil
 
+        // Tear down old session synchronously. Because we are on sessionQueue (not main),
+        // CoreAudio's dispatch_sync(main) for property notifications can still complete,
+        // avoiding the CAGuard deadlock that plagued the main-thread approach.
         if let old = session {
             let oldSid = sessionID
             let oldSamples = sampleCount
             log("[session-\(oldSid)] Stopping old session (samples received: \(oldSamples))")
-            #if false // Enable for instrumented debugging
-            old.removeObserver(self, forKeyPath: "running")
-            #endif
-            // Tear down the audio pipeline on the main thread before dispatching
-            // stopRunning(). The CMIO graph holds a semaphore that coreaudiod's
-            // AudioDeviceManager thread waits on; removing inputs/outputs releases
-            // that graph and frees the semaphore, reducing the chance that a
-            // background stopRunning() deadlocks on a disconnected Bluetooth device.
+
+            // Detach delegate first to stop sample callbacks immediately.
             for output in old.outputs {
                 if let audioOutput = output as? AVCaptureAudioDataOutput {
                     audioOutput.setSampleBufferDelegate(nil, queue: nil)
                 }
-                old.removeOutput(output)
             }
-            for input in old.inputs {
-                old.removeInput(input)
-            }
-            // Stop the old session on a background thread. Even with inputs/outputs
-            // removed, stopRunning() can still hang if CoreAudio's HALB_Guard is
-            // waiting on a condition variable for the dead Bluetooth device.
+
+            // Remove outputs and inputs on sessionQueue (safe: not main thread).
+            for output in old.outputs { old.removeOutput(output) }
+            for input in old.inputs { old.removeInput(input) }
+
+            // stopRunning() can hang if CoreAudio's HALB_Guard is waiting on a
+            // condition variable for a dead Bluetooth device. Run it on a separate
+            // thread with a bounded timeout so sessionQueue isn't blocked forever.
+            let group = DispatchGroup()
+            group.enter()
             DispatchQueue.global(qos: .utility).async {
-                log("[session-\(oldSid)] Background: stopping old session...")
                 old.stopRunning()
-                log("[session-\(oldSid)] Background: old session stopped")
+                group.leave()
             }
-            // Watchdog: warn if stopRunning() hangs (likely deadlocked on dead device)
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10.0) { [weak old] in
-                if let old, old.isRunning {
-                    log("[session-\(oldSid)] WARNING: stopRunning() did not complete in 10s (likely deadlocked on dead Bluetooth device)")
-                }
+            let result = group.wait(timeout: .now() + 10.0)
+            if result == .timedOut {
+                log("[session-\(oldSid)] WARNING: stopRunning() did not complete in 10s (likely deadlocked on dead Bluetooth device)")
+            } else {
+                log("[session-\(oldSid)] Old session stopped")
             }
         }
         session = nil
-        stopHeartbeat()
+        stopHeartbeat_onSampleQueue()
 
-        sampleCount = 0
-        lastSampleTime = nil
+        // Reset sample state on sampleQueue
+        sampleQueue.sync {
+            sampleCount = 0
+            silentSampleCount = 0
+            lastSilentSampleCount = 0
+            silentStreakStart = nil
+            lastSampleTime = nil
+        }
+
         sessionStartTime = Date()
         sessionID += 1
         let sid = sessionID
@@ -256,9 +292,6 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         log("[session-\(sid)] Opening device: \(device.localizedName) [id=\(currentDeviceID)]")
 
         let s = AVCaptureSession()
-        #if false // Enable for instrumented debugging
-        s.addObserver(self, forKeyPath: "running", options: [.new, .old], context: nil)
-        #endif
 
         do {
             let input = try AVCaptureDeviceInput(device: device)
@@ -269,7 +302,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         }
 
         let output = AVCaptureAudioDataOutput()
-        output.setSampleBufferDelegate(self, queue: .main)
+        output.setSampleBufferDelegate(self, queue: sampleQueue)
         s.addOutput(output)
 
         log("[session-\(sid)] Starting session...")
@@ -277,111 +310,135 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         session = s
         log("[session-\(sid)] Keeping warm: \(device.localizedName) (isRunning=\(s.isRunning))")
 
-        startHeartbeat(sid: sid)
+        startHeartbeat(sid: sid, deviceID: currentDeviceID)
         return true
     }
 
-    #if false // Enable for instrumented debugging
-    // KVO observer for session running state
-    override func observeValue(forKeyPath keyPath: String?, of object: Any?,
-                               change: [NSKeyValueChangeKey: Any]?, context: UnsafeMutableRawPointer?) {
-        if keyPath == "running", let newVal = change?[.newKey] as? Bool {
-            let oldVal = change?[.oldKey] as? Bool ?? false
-            log("[session-\(sessionID)] isRunning changed: \(oldVal) -> \(newVal) (samples: \(sampleCount))")
-            if !newVal && oldVal {
-                log("[session-\(sessionID)] *** SESSION STOPPED (samples: \(sampleCount))")
-                logAllDevices(prefix: "[session-\(sessionID) STOPPED]")
-            }
-        }
-    }
-    #endif
+    // MARK: - Sample buffer delegate (runs on sampleQueue)
 
-    // AVCaptureAudioDataOutputSampleBufferDelegate
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         sampleCount += 1
         lastSampleTime = Date()
 
-        #if false // Enable for instrumented debugging
         if sampleCount == 1 {
             let latency = sessionStartTime.map { Date().timeIntervalSince($0) } ?? 0
             log("[session-\(sessionID)] First sample received (latency: \(String(format: "%.3f", latency))s)")
+            // Reset consecutive zero-sample counter on successful sample delivery
+            consecutiveZeroSampleRestarts = 0
         } else if sampleCount == 10 {
             log("[session-\(sessionID)] 10 samples received, stream flowing")
         }
-        #endif
+
+        // Check if audio buffer contains only silence (all zeros).
+        // This detects "signal goes flat" where samples keep flowing but are empty.
+        if let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) {
+            var length = 0
+            var dataPointer: UnsafeMutablePointer<Int8>?
+            if CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: nil,
+                                           totalLengthOut: &length, dataPointerOut: &dataPointer) == noErr,
+               let ptr = dataPointer, length > 0 {
+                let isSilent = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
+                    .withMemoryRebound(to: UInt8.self, capacity: length) { buf in
+                        for i in 0..<length { if buf[i] != 0 { return false } }
+                        return true
+                    }
+                if isSilent {
+                    silentSampleCount += 1
+                    if silentStreakStart == nil { silentStreakStart = Date() }
+                } else {
+                    if let start = silentStreakStart {
+                        let duration = Date().timeIntervalSince(start)
+                        if duration > 2.0 {
+                            log("[session-\(sessionID)] Silent streak ended: \(String(format: "%.1f", duration))s (\(silentSampleCount - lastSilentSampleCount) silent buffers)")
+                        }
+                    }
+                    lastSilentSampleCount = silentSampleCount
+                    silentStreakStart = nil
+                }
+            }
+        }
     }
 
-    #if false // Enable for instrumented debugging
     func captureOutput(_ output: AVCaptureOutput,
                        didDrop sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         log("[session-\(sessionID)] *** DROPPED FRAME (total samples: \(sampleCount))")
     }
-    #endif
 
-    // MARK: - Heartbeat
+    // MARK: - Heartbeat (runs on sampleQueue)
 
-    private func startHeartbeat(sid: UInt32) {
-        let timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.schedule(deadline: .now() + 5.0, repeating: 5.0)
-        timer.setEventHandler { [weak self] in
-            guard let self, self.sessionID == sid else { return }
-            let delta = self.sampleCount - self.lastHeartbeatSampleCount
-            let running = self.session?.isRunning ?? false
-            let gap = self.lastSampleTime.map { Date().timeIntervalSince($0) } ?? -1
+    private func startHeartbeat(sid: UInt32, deviceID: AudioDeviceID) {
+        sampleQueue.async { [self] in
+            heartbeatTimer?.cancel()
+            lastHeartbeatSampleCount = 0
 
-            #if false // Enable for instrumented debugging
-            // Detailed CoreAudio-level state of current device
-            let isAlive: UInt32 = self.currentDeviceID > 0
-                ? (getAudioProperty(self.currentDeviceID, selector: kAudioDevicePropertyDeviceIsAlive) ?? 0)
-                : 99
-            let isRunning: UInt32 = self.currentDeviceID > 0
-                ? (getAudioProperty(self.currentDeviceID, selector: kAudioDevicePropertyDeviceIsRunning) ?? 0)
-                : 99
-            let runningSomewhere: UInt32 = self.currentDeviceID > 0
-                ? (getAudioProperty(self.currentDeviceID, selector: kAudioDevicePropertyDeviceIsRunningSomewhere) ?? 0)
-                : 99
-            let hogPID: pid_t = self.currentDeviceID > 0
-                ? (getAudioProperty(self.currentDeviceID, selector: kAudioDevicePropertyHogMode) ?? -1)
-                : -1
-            #endif
+            let timer = DispatchSource.makeTimerSource(queue: sampleQueue)
+            timer.schedule(deadline: .now() + 5.0, repeating: 5.0)
+            timer.setEventHandler { [weak self] in
+                guard let self, self.sessionID == sid else { return }
+                let delta = self.sampleCount - self.lastHeartbeatSampleCount
+                let running = self.session?.isRunning ?? false
+                let gap = self.lastSampleTime.map { Date().timeIntervalSince($0) } ?? -1
 
-            if delta == 0 && self.sampleCount > 0 {
-                log("[session-\(sid)] *** HEARTBEAT: NO NEW SAMPLES in 5s (total: \(self.sampleCount), gap: \(String(format: "%.1f", gap))s)")
-                // Auto-recover if samples stopped for >15s
-                if gap > 15.0 {
-                    log("[session-\(sid)] *** AUTO-RECOVERY: samples stopped for \(String(format: "%.0f", gap))s, restarting session")
-                    self.startSession()
+                // Detailed CoreAudio-level state of current device
+                let isAlive: UInt32 = deviceID > 0
+                    ? (getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsAlive) ?? 0)
+                    : 99
+                let devRunning: UInt32 = deviceID > 0
+                    ? (getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsRunning) ?? 0)
+                    : 99
+                let runningSomewhere: UInt32 = deviceID > 0
+                    ? (getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsRunningSomewhere) ?? 0)
+                    : 99
+                let hogPID: pid_t = deviceID > 0
+                    ? (getAudioProperty(deviceID, selector: kAudioDevicePropertyHogMode) ?? -1)
+                    : -1
+
+                if delta == 0 && self.sampleCount > 0 {
+                    log("[session-\(sid)] *** HEARTBEAT: NO NEW SAMPLES in 5s (total: \(self.sampleCount), gap: \(String(format: "%.1f", gap))s)")
+                    if gap > 15.0 {
+                        log("[session-\(sid)] *** AUTO-RECOVERY: samples stopped for \(String(format: "%.0f", gap))s, restarting session")
+                        self.sessionQueue.async { self.startSession_onSessionQueue() }
+                    }
+                } else if delta == 0 && self.sampleCount == 0 {
+                    let age = self.sessionStartTime.map { Date().timeIntervalSince($0) } ?? 0
+                    log("[session-\(sid)] *** HEARTBEAT: ZERO SAMPLES (sessionRunning=\(running), age: \(String(format: "%.1f", age))s, alive=\(isAlive), devRunning=\(devRunning))")
+                    if age > 30.0 && running {
+                        self.consecutiveZeroSampleRestarts += 1
+                        log("[session-\(sid)] *** AUTO-RECOVERY: zero samples for \(String(format: "%.0f", age))s (consecutive: \(self.consecutiveZeroSampleRestarts)), restarting session")
+                        self.sessionQueue.async { self.startSession_onSessionQueue() }
+                    }
+                } else {
+                    let silentDelta = self.silentSampleCount - self.lastSilentSampleCount
+                    let silentInfo = silentDelta > 0 ? ", silent=\(silentDelta)/\(delta)" : ""
+                    if let start = self.silentStreakStart {
+                        let streakDur = Date().timeIntervalSince(start)
+                        log("[session-\(sid)] *** HEARTBEAT: SIGNAL FLAT for \(String(format: "%.1f", streakDur))s (+\(delta) samples, \(silentDelta) silent, alive=\(isAlive), devRunning=\(devRunning), runningSomewhere=\(runningSomewhere), hogPID=\(hogPID))")
+                    } else {
+                        log("[session-\(sid)] heartbeat: +\(delta) samples (total: \(self.sampleCount), running=\(running), alive=\(isAlive), devRunning=\(devRunning), runningSomewhere=\(runningSomewhere), hogPID=\(hogPID)\(silentInfo))")
+                    }
+                    self.lastSilentSampleCount = self.silentSampleCount
                 }
-            } else if delta == 0 && self.sampleCount == 0 {
-                let age = self.sessionStartTime.map { Date().timeIntervalSince($0) } ?? 0
-                log("[session-\(sid)] *** HEARTBEAT: ZERO SAMPLES (sessionRunning=\(running), age: \(String(format: "%.1f", age))s)")
-                // Auto-recover if zero samples for >30s (allows time for TCC dialog)
-                if age > 30.0 && running {
-                    log("[session-\(sid)] *** AUTO-RECOVERY: zero samples for \(String(format: "%.0f", age))s, restarting session")
-                    self.startSession()
-                }
+                self.lastHeartbeatSampleCount = self.sampleCount
             }
-            // Normal heartbeat logging (only in instrumented builds):
-            // else { log("[session-\(sid)] heartbeat: +\(delta) samples ...") }
-            self.lastHeartbeatSampleCount = self.sampleCount
+            timer.resume()
+            heartbeatTimer = timer
         }
-        timer.resume()
-        heartbeatTimer = timer
-        lastHeartbeatSampleCount = 0
     }
 
-    private func stopHeartbeat() {
-        heartbeatTimer?.cancel()
-        heartbeatTimer = nil
+    private func stopHeartbeat_onSampleQueue() {
+        sampleQueue.sync {
+            heartbeatTimer?.cancel()
+            heartbeatTimer = nil
+        }
     }
 
     // MARK: - System-level CoreAudio listeners
 
     private func installDeviceListener() {
-        // Default input device changes
+        // Default input device changes. Fires on main (lightweight log + dispatch to sessionQueue).
         var inputAddr = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDefaultInputDevice,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -391,7 +448,6 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         ) { [weak self] _, _ in
             guard let self else { return }
             let currentDevice = AVCaptureDevice.default(for: .audio)
-            #if false // Enable for instrumented debugging
             let defaultID: AudioDeviceID? = getAudioProperty(
                 AudioObjectID(kAudioObjectSystemObject),
                 selector: kAudioHardwarePropertyDefaultInputDevice)
@@ -399,11 +455,9 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             if let did = defaultID {
                 log("[system]   New default: \(describeDevice(did))")
             }
-            #endif
             self.debouncedRestart(reason: "default input device changed (new: \(currentDevice?.localizedName ?? "nil"))")
         }
 
-        #if false // Enable for instrumented debugging
         // Device list changes (additions/removals)
         var devicesAddr = AudioObjectPropertyAddress(
             mSelector: kAudioHardwarePropertyDevices,
@@ -431,98 +485,83 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                 log("[system] Default output device changed -> \(describeDevice(oid))")
             }
         }
-        #endif
     }
 
-    #if false // Enable for instrumented debugging
-    // Per-device property listeners for every audio device
+    // Per-device property listeners. Dispatched to listenerQueue (not main, not sessionQueue)
+    // to avoid deadlocks. Listeners are tracked for proper cleanup on reinstall.
     private func installPerDeviceListeners() {
+        // Clean up old listeners first
+        removePerDeviceListeners()
+
         let devices = getAllAudioDeviceIDs()
-        for deviceID in devices {
-            let name = getStringProperty(deviceID, selector: kAudioObjectPropertyName) ?? "?"
+        listenerQueue.sync { [self] in
+            for deviceID in devices {
+                let name = getStringProperty(deviceID, selector: kAudioObjectPropertyName) ?? "?"
 
-            // Device alive state
-            var aliveAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyDeviceIsAlive,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain)
-            AudioObjectAddPropertyListenerBlock(deviceID, &aliveAddr, DispatchQueue.main) { _, _ in
-                let alive: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsAlive) ?? 99
-                log("[device] \(name) [id=\(deviceID)] isAlive changed -> \(alive)")
-            }
+                func addListener(_ selector: AudioObjectPropertySelector,
+                                 _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
+                                 handler: @escaping () -> Void) {
+                    let block: AudioObjectPropertyListenerBlock = { _, _ in handler() }
+                    var addr = AudioObjectPropertyAddress(
+                        mSelector: selector, mScope: scope,
+                        mElement: kAudioObjectPropertyElementMain)
+                    AudioObjectAddPropertyListenerBlock(deviceID, &addr, listenerQueue, block)
+                    perDeviceListeners.append(ListenerRegistration(
+                        deviceID: deviceID, address: addr, block: block))
+                }
 
-            // Device running state
-            var runningAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyDeviceIsRunning,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain)
-            AudioObjectAddPropertyListenerBlock(deviceID, &runningAddr, DispatchQueue.main) { _, _ in
-                let running: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsRunning) ?? 99
-                log("[device] \(name) [id=\(deviceID)] isRunning changed -> \(running)")
-            }
+                addListener(kAudioDevicePropertyDeviceIsAlive) {
+                    let alive: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsAlive) ?? 99
+                    log("[device] \(name) [id=\(deviceID)] isAlive changed -> \(alive)")
+                }
 
-            // Device running somewhere (any process)
-            var runningSomewhereAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain)
-            AudioObjectAddPropertyListenerBlock(deviceID, &runningSomewhereAddr, DispatchQueue.main) { _, _ in
-                let rs: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsRunningSomewhere) ?? 99
-                log("[device] \(name) [id=\(deviceID)] isRunningSomewhere changed -> \(rs)")
-            }
+                addListener(kAudioDevicePropertyDeviceIsRunning) {
+                    let running: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsRunning) ?? 99
+                    log("[device] \(name) [id=\(deviceID)] isRunning changed -> \(running)")
+                }
 
-            // Hog mode (exclusive access)
-            var hogAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyHogMode,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain)
-            AudioObjectAddPropertyListenerBlock(deviceID, &hogAddr, DispatchQueue.main) { _, _ in
-                let hog: pid_t = getAudioProperty(deviceID, selector: kAudioDevicePropertyHogMode) ?? -1
-                log("[device] *** \(name) [id=\(deviceID)] hogMode changed -> PID \(hog)")
-            }
+                addListener(kAudioDevicePropertyDeviceIsRunningSomewhere) {
+                    let rs: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsRunningSomewhere) ?? 99
+                    log("[device] \(name) [id=\(deviceID)] isRunningSomewhere changed -> \(rs)")
+                }
 
-            // Data source changes (relevant for input source switching)
-            var dataSourceAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyDataSource,
-                mScope: kAudioObjectPropertyScopeInput,
-                mElement: kAudioObjectPropertyElementMain)
-            AudioObjectAddPropertyListenerBlock(deviceID, &dataSourceAddr, DispatchQueue.main) { _, _ in
-                let src: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDataSource,
-                                                    scope: kAudioObjectPropertyScopeInput) ?? 0
-                log("[device] \(name) [id=\(deviceID)] input dataSource changed -> \(src)")
-            }
+                addListener(kAudioDevicePropertyHogMode) {
+                    let hog: pid_t = getAudioProperty(deviceID, selector: kAudioDevicePropertyHogMode) ?? -1
+                    log("[device] *** \(name) [id=\(deviceID)] hogMode changed -> PID \(hog)")
+                }
 
-            // Nominal sample rate changes (Bluetooth codec switches)
-            var rateAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyNominalSampleRate,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain)
-            AudioObjectAddPropertyListenerBlock(deviceID, &rateAddr, DispatchQueue.main) { _, _ in
-                let rate: Float64 = getAudioProperty(deviceID, selector: kAudioDevicePropertyNominalSampleRate) ?? 0
-                log("[device] \(name) [id=\(deviceID)] sampleRate changed -> \(rate) Hz")
-            }
+                addListener(kAudioDevicePropertyDataSource, kAudioObjectPropertyScopeInput) {
+                    let src: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDataSource,
+                                                        scope: kAudioObjectPropertyScopeInput) ?? 0
+                    log("[device] \(name) [id=\(deviceID)] input dataSource changed -> \(src)")
+                }
 
-            // Stream configuration changes
-            var streamAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyStreamConfiguration,
-                mScope: kAudioObjectPropertyScopeInput,
-                mElement: kAudioObjectPropertyElementMain)
-            AudioObjectAddPropertyListenerBlock(deviceID, &streamAddr, DispatchQueue.main) { _, _ in
-                log("[device] \(name) [id=\(deviceID)] input stream configuration changed")
-            }
+                addListener(kAudioDevicePropertyNominalSampleRate) {
+                    let rate: Float64 = getAudioProperty(deviceID, selector: kAudioDevicePropertyNominalSampleRate) ?? 0
+                    log("[device] \(name) [id=\(deviceID)] sampleRate changed -> \(rate) Hz")
+                }
 
-            // Device "has changed" (generic catch-all)
-            var changedAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyDeviceHasChanged,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain)
-            AudioObjectAddPropertyListenerBlock(deviceID, &changedAddr, DispatchQueue.main) { _, _ in
-                log("[device] \(name) [id=\(deviceID)] deviceHasChanged fired")
+                addListener(kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeInput) {
+                    log("[device] \(name) [id=\(deviceID)] input stream configuration changed")
+                }
             }
+            log("[listeners] Per-device listeners installed for \(devices.count) devices (\(perDeviceListeners.count) total)")
         }
-        log("[listeners] Per-device listeners installed for \(devices.count) devices")
     }
-    #endif
+
+    private func removePerDeviceListeners() {
+        listenerQueue.sync { [self] in
+            if perDeviceListeners.isEmpty { return }
+            var removed = 0
+            for var reg in perDeviceListeners {
+                let status = AudioObjectRemovePropertyListenerBlock(
+                    reg.deviceID, &reg.address, listenerQueue, reg.block)
+                if status == noErr { removed += 1 }
+            }
+            log("[listeners] Removed \(removed)/\(perDeviceListeners.count) per-device listeners")
+            perDeviceListeners.removeAll()
+        }
+    }
 
     private func installConnectionObservers() {
         let nc = NotificationCenter.default
@@ -544,7 +583,6 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             }
         }
 
-        #if false // Enable for instrumented debugging
         // Session lifecycle notifications
         nc.addObserver(forName: .AVCaptureSessionDidStartRunning, object: nil, queue: .main) {
             [weak self] _ in
@@ -555,13 +593,11 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             [weak self] _ in
             guard let self else { return }
             log("[avfoundation] [session-\(self.sessionID)] *** AVCaptureSessionDidStopRunning")
-            logAllDevices(prefix: "[avfoundation] [session-\(self.sessionID) STOPPED]")
         }
         nc.addObserver(forName: .AVCaptureSessionWasInterrupted, object: nil, queue: .main) {
             [weak self] note in
             guard let self else { return }
             log("[avfoundation] [session-\(self.sessionID)] *** AVCaptureSessionWasInterrupted (userInfo: \(note.userInfo ?? [:]))")
-            logAllDevices(prefix: "[avfoundation] [session-\(self.sessionID) INTERRUPTED]")
         }
         nc.addObserver(forName: .AVCaptureSessionInterruptionEnded, object: nil, queue: .main) {
             [weak self] _ in
@@ -573,46 +609,69 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             guard let self else { return }
             let err = note.userInfo?[AVCaptureSessionErrorKey] as? Error
             log("[avfoundation] [session-\(self.sessionID)] *** AVCaptureSessionRuntimeError: \(err?.localizedDescription ?? "unknown")")
-            logAllDevices(prefix: "[avfoundation] [session-\(self.sessionID) ERROR]")
         }
-        #endif
+
+        // Sleep/wake events. These correlate with Bluetooth disconnections, coreaudiod
+        // state resets, and the "signal goes flat" silent-buffer issue on AirPods.
+        let ws = NSWorkspace.shared.notificationCenter
+        ws.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) {
+            [weak self] _ in
+            guard let self else { return }
+            log("[system] *** SLEEP (session-\(self.sessionID), samples: \(self.sampleCount))")
+        }
+        ws.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) {
+            [weak self] _ in
+            guard let self else { return }
+            log("[system] *** WAKE (session-\(self.sessionID), samples: \(self.sampleCount))")
+            logAllDevices(prefix: "[system] [post-wake]")
+        }
+        ws.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) {
+            _ in log("[system] Screens did sleep (lid close or display sleep)")
+        }
+        ws.addObserver(forName: NSWorkspace.screensDidWakeNotification, object: nil, queue: .main) {
+            _ in log("[system] Screens did wake")
+        }
     }
 
+    // MARK: - Debounced restart
+
     private func debouncedRestart(reason: String) {
-        debounceWork?.cancel()
-        debounceWork = nil
-        log("Device event: \(reason) (waiting \(Int(debounceSeconds))s to settle)")
-        let work = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            log("Debounce fired, restarting session...")
-            if self.startSession() {
-                log("Restarted after device change")
-                #if false // Enable for instrumented debugging
-                self.installPerDeviceListeners()
-                #endif
-            } else {
-                log("No audio device available after change. Waiting for recovery...")
-                self.scheduleRecovery()
+        sessionQueue.async { [self] in
+            debounceWork?.cancel()
+            debounceWork = nil
+            log("Device event: \(reason) (waiting \(Int(debounceSeconds))s to settle)")
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                log("Debounce fired, restarting session...")
+                if self.startSession_onSessionQueue() {
+                    log("Restarted after device change")
+                    self.installPerDeviceListeners()
+                } else {
+                    log("No audio device available after change. Waiting for recovery...")
+                    self.scheduleRecovery_onSessionQueue()
+                }
             }
+            debounceWork = work
+            sessionQueue.asyncAfter(deadline: .now() + debounceSeconds, execute: work)
         }
-        debounceWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + debounceSeconds, execute: work)
     }
 
     // MARK: - Recovery
 
-    private func scheduleRecovery() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+    private func scheduleRecovery_onSessionQueue() {
+        sessionQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self else { return }
-            if self.startSession() {
+            if self.startSession_onSessionQueue() {
                 self.installListenersOnce()
                 log("Recovered")
             } else {
                 log("Still no audio device. Retrying...")
-                self.scheduleRecovery()
+                self.scheduleRecovery_onSessionQueue()
             }
         }
     }
+
+    // MARK: - Shutdown
 
     func signalShutdown() {
         // Skip stopRunning() here: it can deadlock on Bluetooth devices, and
@@ -623,7 +682,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     func shutdown() {
         debounceWork?.cancel()
-        stopHeartbeat()
+        stopHeartbeat_onSampleQueue()
+        removePerDeviceListeners()
         // Skip stopRunning(): it can deadlock on Bluetooth devices.
         // Process exit reclaims all resources.
         session = nil
@@ -648,6 +708,6 @@ func installSignalHandlers() {
 }
 
 installSignalHandlers()
-log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.9.2)")
+log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.10.0)")
 keeper.start()
 dispatchMain()
