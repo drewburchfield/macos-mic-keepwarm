@@ -708,6 +708,9 @@ func installSignalHandlers() {
 }
 
 installSignalHandlers()
-log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.10.0)")
+log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.10.1)")
 keeper.start()
-dispatchMain()
+// NSApplication.shared.run() services both the GCD main queue (like dispatchMain())
+// AND the NSApplication run loop, which is required for NSWorkspace sleep/wake
+// notifications. Safe for headless LaunchAgent use.
+NSApplication.shared.run()
