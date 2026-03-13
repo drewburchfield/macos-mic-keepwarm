@@ -2,4 +2,5 @@
 .swiftpm/
 .DS_Store
 diagnostics/
+docs/
 apple-feedback-draft.md
