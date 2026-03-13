@@ -115,6 +115,16 @@ func logAllDevices(prefix: String) {
     }
 }
 
+// MARK: - CLI flags
+
+let skipBluetooth = CommandLine.arguments.contains("--skip-bluetooth")
+
+func isBluetoothDevice(_ deviceID: AudioDeviceID) -> Bool {
+    let transport: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyTransportType) ?? 0
+    return transport == kAudioDeviceTransportTypeBluetooth
+        || transport == kAudioDeviceTransportTypeBluetoothLE
+}
+
 // MARK: - PID file
 
 let pidPath = "/tmp/mic-warm.pid"
@@ -152,6 +162,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private var debounceWork: DispatchWorkItem?
     private let debounceSeconds: Double = 3.0
     private var listenersInstalled = false
+    private var pausedForBluetooth = false
 
     private var sampleCount: UInt64 = 0
     private var lastSampleTime: Date?
@@ -165,16 +176,23 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         killStalePID()
         writePID()
 
+        if skipBluetooth {
+            log("Bluetooth skip enabled: will not hold mic open on Bluetooth devices")
+        }
+
         #if false // Enable for instrumented debugging
         log("=== STARTUP DEVICE SNAPSHOT ===")
         logAllDevices(prefix: "[startup]")
         log("=== END STARTUP SNAPSHOT ===")
         #endif
 
-        guard startSession() else {
-            log("Error: No audio input device found. Waiting for recovery...")
-            scheduleRecovery()
-            return
+        if !startSession() {
+            if pausedForBluetooth {
+                log("Bluetooth device active, waiting for non-Bluetooth device...")
+            } else {
+                log("Error: No audio input device found. Waiting for recovery...")
+                scheduleRecovery()
+            }
         }
 
         installListenersOnce()
@@ -252,6 +270,16 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         currentDeviceID = getAllAudioDeviceIDs().first {
             getStringProperty($0, selector: kAudioDevicePropertyDeviceUID) == device.uniqueID
         } ?? 0
+
+        // Skip Bluetooth devices to avoid forcing SCO (telephony) mode,
+        // which degrades audio output quality on AirPods and headsets.
+        if skipBluetooth && isBluetoothDevice(currentDeviceID) {
+            let transport: UInt32 = getAudioProperty(currentDeviceID, selector: kAudioDevicePropertyTransportType) ?? 0
+            log("[session-\(sid)] Skipping Bluetooth device: \(device.localizedName) [transport=\(transportTypeName(transport))]")
+            pausedForBluetooth = true
+            return false
+        }
+        pausedForBluetooth = false
 
         log("[session-\(sid)] Opening device: \(device.localizedName) [id=\(currentDeviceID)]")
 
@@ -590,6 +618,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                 #if false // Enable for instrumented debugging
                 self.installPerDeviceListeners()
                 #endif
+            } else if self.pausedForBluetooth {
+                log("Bluetooth device active, pausing keep-warm")
             } else {
                 log("No audio device available after change. Waiting for recovery...")
                 self.scheduleRecovery()
@@ -648,6 +678,6 @@ func installSignalHandlers() {
 }
 
 installSignalHandlers()
-log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.9.2)")
+log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.9.2\(skipBluetooth ? ", skip-bluetooth" : ""))")
 keeper.start()
 dispatchMain()

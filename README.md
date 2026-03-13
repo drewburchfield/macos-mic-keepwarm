@@ -76,7 +76,35 @@ When you connect or disconnect AirPods, a Bluetooth headset, or any audio device
 - Works with: built-in mic, AirPods, Bluetooth headsets, USB mics, any input device
 - Instant device-change detection via CoreAudio event listener (no polling)
 - Auto-recovery from Bluetooth disconnects, coreaudiod restarts, and stalled sessions
-- **Bluetooth audio note:** holding the mic open on AirPods/Bluetooth keeps the connection in SCO (telephony) mode, which slightly reduces output audio quality. This is a Bluetooth protocol limitation, not specific to mic-warm. Any app using the mic causes the same behavior.
+- **Bluetooth audio note:** holding the mic open on AirPods/Bluetooth keeps the connection in SCO (telephony) mode, which slightly reduces output audio quality. This is a Bluetooth protocol limitation, not specific to mic-warm. Any app using the mic causes the same behavior. Use `--skip-bluetooth` to avoid this (see below).
+
+### Bluetooth Skip Mode
+
+If you primarily use AirPods or a Bluetooth headset for music and podcasts, the SCO quality drop may not be worth the faster push-to-talk activation. Pass `--skip-bluetooth` to pause keep-warm whenever the default input device is Bluetooth:
+
+```bash
+mic-warm --skip-bluetooth
+```
+
+With this flag:
+- **Built-in mic, wired headphones, USB mics:** keep-warm runs normally (instant push-to-talk)
+- **AirPods / Bluetooth headsets:** keep-warm pauses (audio stays in high-quality A2DP/AAC mode)
+- **Switching between them:** automatic. The CoreAudio device change listener detects the switch and resumes or pauses within 3 seconds.
+
+The trade-off is that push-to-talk will still have the 2-5 second delay when using Bluetooth, but your music and podcast audio quality is preserved.
+
+To install with `--skip-bluetooth` enabled by default, edit the LaunchAgent plist after installing:
+
+```bash
+# Install normally first
+curl -fsSL https://raw.githubusercontent.com/drewburchfield/macos-mic-keepwarm/master/install.sh | bash
+
+# Then add the flag to the LaunchAgent
+PLIST="$HOME/Library/LaunchAgents/com.user.keep-mic-warm.plist"
+launchctl unload "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :ProgramArguments: string --skip-bluetooth" "$PLIST"
+launchctl load "$PLIST"
+```
 
 ## Installation
 
