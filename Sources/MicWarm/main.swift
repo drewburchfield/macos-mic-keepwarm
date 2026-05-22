@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CoreAudio
 import Darwin
@@ -161,6 +162,11 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private var sessionID: UInt32 = 0
     private var currentDeviceID: AudioDeviceID = 0
 
+    // Called on main queue whenever warm/cold state changes.
+    var onStateChange: ((Bool) -> Void)?
+
+    var isWarm: Bool { session != nil }
+
     func start() {
         killStalePID()
         writePID()
@@ -245,6 +251,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 
         guard let device = AVCaptureDevice.default(for: .audio) else {
             log("[session-\(sid)] No default audio device found")
+            onStateChange?(false)
             return false
         }
 
@@ -265,6 +272,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             s.addInput(input)
         } catch {
             log("[session-\(sid)] Error: Could not open mic: \(error.localizedDescription)")
+            onStateChange?(false)
             return false
         }
 
@@ -278,7 +286,33 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         log("[session-\(sid)] Keeping warm: \(device.localizedName) (isRunning=\(s.isRunning))")
 
         startHeartbeat(sid: sid)
+        onStateChange?(true)
         return true
+    }
+
+    func stop() {
+        debounceWork?.cancel()
+        debounceWork = nil
+        stopHeartbeat()
+        guard let s = session else { return }
+        let sid = sessionID
+        log("[session-\(sid)] Stopping session (user request)")
+        for output in s.outputs {
+            if let audioOutput = output as? AVCaptureAudioDataOutput {
+                audioOutput.setSampleBufferDelegate(nil, queue: nil)
+            }
+            s.removeOutput(output)
+        }
+        for input in s.inputs { s.removeInput(input) }
+        DispatchQueue.global(qos: .utility).async {
+            s.stopRunning()
+            log("[session-\(sid)] Stopped")
+        }
+        session = nil
+        sampleCount = 0
+        lastSampleTime = nil
+        onStateChange?(false)
+        log("[session-\(sid)] Session torn down")
     }
 
     #if false // Enable for instrumented debugging
@@ -632,22 +666,84 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     }
 }
 
-// MARK: - Signal handling & main
+// MARK: - AppDelegate
 
-let keeper = MicKeeper()
+class AppDelegate: NSObject, NSApplicationDelegate {
+    private let keeper = MicKeeper()
+    private var statusItem: NSStatusItem!
+    private let defaults = UserDefaults.standard
+    private let warmKey = "micWarmEnabled"
 
-func installSignalHandlers() {
-    let handler: @convention(c) (Int32) -> Void = { sig in
-        signal(SIGTERM, SIG_DFL)
-        signal(SIGINT, SIG_DFL)
-        keeper.signalShutdown()
-        _exit(0)
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Hide from Dock — menu bar only
+        NSApp.setActivationPolicy(.accessory)
+
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+
+        keeper.onStateChange = { [weak self] isWarm in
+            DispatchQueue.main.async { self?.updateMenu(isWarm: isWarm) }
+        }
+
+        let shouldStart = defaults.object(forKey: warmKey) as? Bool ?? true
+        if shouldStart {
+            log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.9.3)")
+            keeper.start()
+        } else {
+            log("mic-warm starting cold (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.9.3)")
+            updateMenu(isWarm: false)
+        }
     }
-    signal(SIGTERM, handler)
-    signal(SIGINT, handler)
+
+    private func updateMenu(isWarm: Bool) {
+        let button = statusItem.button
+        if isWarm {
+            button?.image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Mic Warm")
+            button?.image?.isTemplate = true
+        } else {
+            button?.image = NSImage(systemSymbolName: "mic.slash.fill", accessibilityDescription: "Mic Cold")
+            button?.image?.isTemplate = true
+        }
+
+        let menu = NSMenu()
+
+        let statusTitle = isWarm ? "Mic is warm 🔥" : "Mic is cold"
+        let statusItem = NSMenuItem(title: statusTitle, action: nil, keyEquivalent: "")
+        statusItem.isEnabled = false
+        menu.addItem(statusItem)
+
+        menu.addItem(.separator())
+
+        let toggleTitle = isWarm ? "Turn Off" : "Turn On"
+        let toggleItem = NSMenuItem(title: toggleTitle, action: #selector(toggleWarm), keyEquivalent: "t")
+        toggleItem.target = self
+        menu.addItem(toggleItem)
+
+        menu.addItem(.separator())
+
+        let quitItem = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quitItem)
+
+        self.statusItem.menu = menu
+    }
+
+    @objc private func toggleWarm() {
+        if keeper.isWarm {
+            keeper.stop()
+            defaults.set(false, forKey: warmKey)
+        } else {
+            keeper.start()
+            defaults.set(true, forKey: warmKey)
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        keeper.shutdown()
+    }
 }
 
-installSignalHandlers()
-log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.9.2)")
-keeper.start()
-dispatchMain()
+// MARK: - Main
+
+let app = NSApplication.shared
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()

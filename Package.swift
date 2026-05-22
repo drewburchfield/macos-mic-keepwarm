@@ -11,6 +11,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreAudio"),
+                .linkedFramework("AppKit"),
             ]
         )
     ]
