@@ -99,6 +99,39 @@ func describeDevice(_ deviceID: AudioDeviceID) -> String {
     return "\(name) [id=\(deviceID) uid=\(uid) transport=\(transportTypeName(transport)) alive=\(isAlive) running=\(isRunning) runningSomewhere=\(isRunningSomewhere) hogPID=\(hogPID) inputStreams=\(inputStreams)]"
 }
 
+// The first input stream's active (virtual) format. The clearest in-process signal for the
+// Bluetooth profile in use: HFP/SCO presents as ~8k/16kHz mono, whereas other modes differ.
+// Comparing this at flat-onset vs recovery tells us whether the SCO link was actually carrying audio.
+func inputStreamFormatDescription(_ deviceID: AudioDeviceID) -> String {
+    guard deviceID > 0 else { return "no device" }
+    var streamsAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: kAudioObjectPropertyScopeInput,
+        mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    AudioObjectGetPropertyDataSize(deviceID, &streamsAddr, 0, nil, &size)
+    let count = Int(size) / MemoryLayout<AudioStreamID>.size
+    guard count > 0 else { return "no input streams" }
+    var streams = [AudioStreamID](repeating: 0, count: count)
+    AudioObjectGetPropertyData(deviceID, &streamsAddr, 0, nil, &size, &streams)
+
+    var fmtAddr = AudioObjectPropertyAddress(
+        mSelector: kAudioStreamPropertyVirtualFormat,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var asbd = AudioStreamBasicDescription()
+    var asbdSize = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+    let status = AudioObjectGetPropertyData(streams[0], &fmtAddr, 0, nil, &asbdSize, &asbd)
+    guard status == noErr else { return "format query failed (status \(status), streams=\(count))" }
+
+    let fid = asbd.mFormatID
+    let fourcc = "\(Character(UnicodeScalar((fid >> 24) & 0xFF) ?? " "))"
+        + "\(Character(UnicodeScalar((fid >> 16) & 0xFF) ?? " "))"
+        + "\(Character(UnicodeScalar((fid >> 8) & 0xFF) ?? " "))"
+        + "\(Character(UnicodeScalar(fid & 0xFF) ?? " "))"
+    return "sampleRate=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame) bits=\(asbd.mBitsPerChannel) format='\(fourcc)' streams=\(count)"
+}
+
 func logAllDevices(prefix: String) {
     let devices = getAllAudioDeviceIDs()
     log("\(prefix) --- All audio devices (\(devices.count)) ---")
@@ -113,6 +146,47 @@ func logAllDevices(prefix: String) {
         log("\(prefix)   Default input: \(getStringProperty(di, selector: kAudioObjectPropertyName) ?? "?") [id=\(di)]")
     } else {
         log("\(prefix)   Default input: NONE")
+    }
+}
+
+// MARK: - Bluetooth/coreaudio unified-log capture
+
+// The macOS unified log holds the SCO/HFP/codec transitions that CoreAudio property values
+// can't show, but on this machine it rotates in tens of minutes. So we snapshot it into a
+// dedicated file the moment a flat signal is detected (and again on recovery), before it ages out.
+let btLogPath = "/tmp/mic-warm-bt.log"
+let btLogQueue = DispatchQueue(label: "com.micwarm.btlog", qos: .utility)
+
+func captureSystemAudioBTLog(reason: String, seconds: Int) {
+    btLogQueue.async {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        proc.arguments = [
+            "show", "--last", "\(seconds)s", "--info", "--debug", "--style", "compact",
+            "--predicate",
+            "(process == \"bluetoothd\") OR (process == \"coreaudiod\") OR (subsystem BEGINSWITH \"com.apple.bluetooth\") OR (subsystem == \"com.apple.coreaudio\")"
+        ]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        let header = "\n========== [\(logDateFormatter.string(from: Date()))] BT/coreaudio capture (last \(seconds)s) :: \(reason) ==========\n"
+        do {
+            try proc.run()
+            // Drain before waiting to avoid a full-pipe deadlock on large output.
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            let fm = FileManager.default
+            if !fm.fileExists(atPath: btLogPath) { fm.createFile(atPath: btLogPath, contents: nil) }
+            if let fh = FileHandle(forWritingAtPath: btLogPath) {
+                fh.seekToEndOfFile()
+                fh.write(header.data(using: .utf8) ?? Data())
+                fh.write(data)
+                try? fh.close()
+            }
+            log("[bt-capture] Wrote \(data.count) bytes to \(btLogPath) :: \(reason)")
+        } catch {
+            log("[bt-capture] Failed to run log show: \(error.localizedDescription)")
+        }
     }
 }
 
@@ -185,6 +259,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private var silentSampleCount: UInt64 = 0
     private var lastSilentSampleCount: UInt64 = 0
     private var silentStreakStart: Date?
+    // Ensures the heavy flat-onset diagnostic capture fires only once per silent streak.
+    private var silentDiagCaptured: Bool = false
 
     // --- Listener tracking (confined to listenerQueue) ---
     private var perDeviceListeners: [ListenerRegistration] = []
@@ -273,6 +349,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             lastSilentSampleCount = 0
             silentStreakStart = nil
             lastSampleTime = nil
+            silentDiagCaptured = false
         }
 
         sessionStartTime = Date()
@@ -309,6 +386,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         s.startRunning()
         session = s
         log("[session-\(sid)] Keeping warm: \(device.localizedName) (isRunning=\(s.isRunning))")
+        log("[session-\(sid)] Input format at start: \(inputStreamFormatDescription(currentDeviceID))")
 
         startHeartbeat(sid: sid, deviceID: currentDeviceID)
         return true
@@ -325,6 +403,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         if sampleCount == 1 {
             let latency = sessionStartTime.map { Date().timeIntervalSince($0) } ?? 0
             log("[session-\(sessionID)] First sample received (latency: \(String(format: "%.3f", latency))s)")
+            log("[session-\(sessionID)] Input format at first sample: \(inputStreamFormatDescription(currentDeviceID))")
             // Reset consecutive zero-sample counter on successful sample delivery
             consecutiveZeroSampleRestarts = 0
         } else if sampleCount == 10 {
@@ -352,10 +431,16 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                         let duration = Date().timeIntervalSince(start)
                         if duration > 2.0 {
                             log("[session-\(sessionID)] Silent streak ended: \(String(format: "%.1f", duration))s (\(silentSampleCount - lastSilentSampleCount) silent buffers)")
+                            log("[session-\(sessionID)] [recovery-diag] input format: \(inputStreamFormatDescription(currentDeviceID))")
+                            // Capture the BT/coreaudio transition that RESTORED audio. Cover the whole
+                            // streak plus a margin so the recovery event is included; compare vs onset.
+                            captureSystemAudioBTLog(reason: "SIGNAL recovered session-\(sessionID) after \(String(format: "%.1f", duration))s", seconds: min(Int(duration) + 15, 200))
+                            DispatchQueue.global(qos: .utility).async { logAllDevices(prefix: "[recovery-diag]") }
                         }
                     }
                     lastSilentSampleCount = silentSampleCount
                     silentStreakStart = nil
+                    silentDiagCaptured = false
                 }
             }
         }
@@ -416,6 +501,14 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                     if let start = self.silentStreakStart {
                         let streakDur = Date().timeIntervalSince(start)
                         log("[session-\(sid)] *** HEARTBEAT: SIGNAL FLAT for \(String(format: "%.1f", streakDur))s (+\(delta) samples, \(silentDelta) silent, alive=\(isAlive), devRunning=\(devRunning), runningSomewhere=\(runningSomewhere), hogPID=\(hogPID))")
+                        log("[session-\(sid)] [flat-diag] input format: \(inputStreamFormatDescription(deviceID))")
+                        // Fire the heavy capture once per streak, at first detection, so we grab the
+                        // SCO/HFP transition that produced the silence before the unified log rotates out.
+                        if !self.silentDiagCaptured {
+                            self.silentDiagCaptured = true
+                            DispatchQueue.global(qos: .utility).async { logAllDevices(prefix: "[flat-diag]") }
+                            captureSystemAudioBTLog(reason: "SIGNAL FLAT onset session-\(sid)", seconds: 45)
+                        }
                     } else {
                         log("[session-\(sid)] heartbeat: +\(delta) samples (total: \(self.sampleCount), running=\(running), alive=\(isAlive), devRunning=\(devRunning), runningSomewhere=\(runningSomewhere), hogPID=\(hogPID)\(silentInfo))")
                     }
@@ -708,7 +801,8 @@ func installSignalHandlers() {
 }
 
 installSignalHandlers()
-log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.10.1)")
+log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.10.2)")
+log("[bt-capture] Flat-signal Bluetooth/coreaudio diagnostics enabled -> \(btLogPath)")
 keeper.start()
 // NSApplication.shared.run() services both the GCD main queue (like dispatchMain())
 // AND the NSApplication run loop, which is required for NSWorkspace sleep/wake
