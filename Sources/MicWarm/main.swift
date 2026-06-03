@@ -175,29 +175,47 @@ func captureSystemAudioBTLog(reason: String, seconds: Int) {
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe
-        let header = "\n========== [\(logDateFormatter.string(from: Date()))] BT/coreaudio capture (last \(seconds)s) :: \(reason) ==========\n"
         do {
             try proc.run()
-            // Drain before waiting to avoid a full-pipe deadlock on large output.
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            proc.waitUntilExit()
-            let fm = FileManager.default
-            // 0700 dir owned by us means no other user can plant a symlink to redirect our writes.
-            try? fm.createDirectory(atPath: btLogDir, withIntermediateDirectories: true,
-                                    attributes: [.posixPermissions: 0o700])
-            if !fm.fileExists(atPath: btLogPath) {
-                fm.createFile(atPath: btLogPath, contents: nil, attributes: [.posixPermissions: 0o600])
-            }
-            if let fh = FileHandle(forWritingAtPath: btLogPath) {
-                fh.seekToEndOfFile()
-                fh.write(header.data(using: .utf8) ?? Data())
-                fh.write(data)
-                try? fh.close()
-            }
-            log("[bt-capture] Wrote \(data.count) bytes to \(btLogPath) :: \(reason)")
         } catch {
-            log("[bt-capture] Failed to run log show: \(error.localizedDescription)")
+            log("[bt-capture] Failed to launch log show: \(error.localizedDescription)")
+            return
         }
+
+        // Read on a separate queue so the whole capture can be bounded by a timeout. `log show`
+        // is normally <2s but was observed taking 75s+ once; without a bound, a slow run would
+        // wedge this serial queue and a later (e.g. recovery) capture would never run. The
+        // semaphore also establishes happens-before ordering for the read of `data` below.
+        var data = Data()
+        let reader = DispatchQueue(label: "com.micwarm.btlog.read")
+        let done = DispatchSemaphore(value: 0)
+        reader.async {
+            data = pipe.fileHandleForReading.readDataToEndOfFile()
+            done.signal()
+        }
+        let timedOut = done.wait(timeout: .now() + 30) == .timedOut
+        if timedOut {
+            log("[bt-capture] log show exceeded 30s; terminating, writing partial :: \(reason)")
+            proc.terminate()  // closes the pipe write end -> the read above hits EOF and returns
+            done.wait()
+        }
+        proc.waitUntilExit()
+
+        let header = "\n========== [\(logDateFormatter.string(from: Date()))] BT/coreaudio capture (last \(seconds)s\(timedOut ? ", TIMED OUT - partial" : "")) :: \(reason) ==========\n"
+        let fm = FileManager.default
+        // 0700 dir owned by us means no other user can plant a symlink to redirect our writes.
+        try? fm.createDirectory(atPath: btLogDir, withIntermediateDirectories: true,
+                                attributes: [.posixPermissions: 0o700])
+        if !fm.fileExists(atPath: btLogPath) {
+            fm.createFile(atPath: btLogPath, contents: nil, attributes: [.posixPermissions: 0o600])
+        }
+        if let fh = FileHandle(forWritingAtPath: btLogPath) {
+            fh.seekToEndOfFile()
+            fh.write(header.data(using: .utf8) ?? Data())
+            fh.write(data)
+            try? fh.close()
+        }
+        log("[bt-capture] Wrote \(data.count) bytes to \(btLogPath)\(timedOut ? " (partial)" : "") :: \(reason)")
     }
 }
 
@@ -713,6 +731,9 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             guard let self else { return }
             let err = note.userInfo?[AVCaptureSessionErrorKey] as? Error
             log("[avfoundation] [session-\(self.sessionID)] *** AVCaptureSessionRuntimeError: \(err?.localizedDescription ?? "unknown")")
+            // Redundant BT capture: this fired during the captured flat episode. Grab the SCO
+            // layer here too, in case the flat-heartbeat path hasn't tripped yet.
+            captureSystemAudioBTLog(reason: "AVCaptureSessionRuntimeError session-\(self.sessionID): \(err?.localizedDescription ?? "unknown")", seconds: 45)
         }
 
         // Sleep/wake events. These correlate with Bluetooth disconnections, coreaudiod

@@ -9,6 +9,10 @@ REPO="drewburchfield/macos-mic-keepwarm"
 BIN_DIR="$HOME/.local/bin"
 BIN_PATH="$BIN_DIR/mic-warm"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.user.keep-mic-warm.plist"
+# Logs live in ~/Library/Logs (persists across reboots, unlike /tmp) alongside the
+# flat-signal Bluetooth capture the binary writes to the same directory.
+LOG_DIR="$HOME/Library/Logs/mic-warm"
+LOG_PATH="$LOG_DIR/mic-warm.log"
 
 echo "Installing mic-warm..."
 
@@ -37,6 +41,9 @@ codesign --force --sign - "$BIN_PATH"
 # Unload existing agent if present
 launchctl unload "$PLIST_PATH" 2>/dev/null || true
 
+# Persistent log directory (0700: keeps diagnostic logs out of world-writable /tmp)
+mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
+
 cat > "$PLIST_PATH" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -53,9 +60,9 @@ cat > "$PLIST_PATH" << EOF
     <key>KeepAlive</key>
     <true/>
     <key>StandardErrorPath</key>
-    <string>/tmp/mic-warm.log</string>
+    <string>${LOG_PATH}</string>
     <key>StandardOutPath</key>
-    <string>/tmp/mic-warm.log</string>
+    <string>${LOG_PATH}</string>
 </dict>
 </plist>
 EOF
@@ -69,5 +76,6 @@ echo ""
 echo "macOS will prompt you to grant mic-warm microphone access."
 echo "Go to System Settings > Privacy & Security > Microphone and allow it."
 echo ""
-echo "Log file: /tmp/mic-warm.log"
+echo "Log file: $LOG_PATH"
+echo "Flat-signal Bluetooth diagnostics: $LOG_DIR/bt.log"
 echo "To uninstall: curl -fsSL https://raw.githubusercontent.com/drewburchfield/macos-mic-keepwarm/master/uninstall.sh | bash"
