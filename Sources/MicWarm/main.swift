@@ -812,8 +812,23 @@ func installSignalHandlers() {
 }
 
 installSignalHandlers()
+
+// Manual diagnostic trigger: `kill -USR1 <pid>` forces a BT/coreaudio capture on demand,
+// without waiting for a flat episode. Lets us verify the capture path works and re-test it
+// later. Uses a DispatchSource (not a raw signal handler) so it can safely do real work;
+// SIG_IGN first so SIGUSR1's default (terminate) doesn't kill the process before GCD delivers it.
+signal(SIGUSR1, SIG_IGN)
+let sigusr1Source = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .global(qos: .utility))
+sigusr1Source.setEventHandler {
+    log("[bt-capture] Manual capture trigger (SIGUSR1)")
+    logAllDevices(prefix: "[manual-diag]")
+    captureSystemAudioBTLog(reason: "manual SIGUSR1 trigger", seconds: 30)
+}
+sigusr1Source.resume()
+
 log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.10.2)")
 log("[bt-capture] Flat-signal Bluetooth/coreaudio diagnostics enabled -> \(btLogPath)")
+log("[bt-capture] Manual trigger: kill -USR1 \(ProcessInfo.processInfo.processIdentifier)")
 keeper.start()
 // NSApplication.shared.run() services both the GCD main queue (like dispatchMain())
 // AND the NSApplication run loop, which is required for NSWorkspace sleep/wake
