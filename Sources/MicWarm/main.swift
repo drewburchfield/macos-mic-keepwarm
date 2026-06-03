@@ -154,7 +154,13 @@ func logAllDevices(prefix: String) {
 // The macOS unified log holds the SCO/HFP/codec transitions that CoreAudio property values
 // can't show, but on this machine it rotates in tens of minutes. So we snapshot it into a
 // dedicated file the moment a flat signal is detected (and again on recovery), before it ages out.
-let btLogPath = "/tmp/mic-warm-bt.log"
+//
+// Written under a user-owned 0700 dir in ~/Library/Logs (not /tmp): a world-writable directory
+// with a predictable filename is a symlink/TOCTOU target (an attacker could pre-plant a symlink
+// and redirect the truncating createFile to clobber a user-writable file). ~/Library/Logs is also
+// the idiomatic macOS log location and survives reboots, unlike /tmp.
+let btLogDir = (NSHomeDirectory() as NSString).appendingPathComponent("Library/Logs/mic-warm")
+let btLogPath = (btLogDir as NSString).appendingPathComponent("bt.log")
 let btLogQueue = DispatchQueue(label: "com.micwarm.btlog", qos: .utility)
 
 func captureSystemAudioBTLog(reason: String, seconds: Int) {
@@ -176,7 +182,12 @@ func captureSystemAudioBTLog(reason: String, seconds: Int) {
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             proc.waitUntilExit()
             let fm = FileManager.default
-            if !fm.fileExists(atPath: btLogPath) { fm.createFile(atPath: btLogPath, contents: nil) }
+            // 0700 dir owned by us means no other user can plant a symlink to redirect our writes.
+            try? fm.createDirectory(atPath: btLogDir, withIntermediateDirectories: true,
+                                    attributes: [.posixPermissions: 0o700])
+            if !fm.fileExists(atPath: btLogPath) {
+                fm.createFile(atPath: btLogPath, contents: nil, attributes: [.posixPermissions: 0o600])
+            }
             if let fh = FileHandle(forWritingAtPath: btLogPath) {
                 fh.seekToEndOfFile()
                 fh.write(header.data(using: .utf8) ?? Data())
