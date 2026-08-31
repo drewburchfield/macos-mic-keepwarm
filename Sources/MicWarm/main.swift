@@ -278,6 +278,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private var currentDeviceID: AudioDeviceID = 0
     private var sessionStartTime: Date?
     private var consecutiveZeroSampleRestarts: Int = 0
+    private var currentDeviceIsBluetooth: Bool = false
 
     // --- Sample state (confined to sampleQueue) ---
     private var sampleCount: UInt64 = 0
@@ -290,6 +291,20 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private var silentStreakStart: Date?
     // Ensures the heavy flat-onset diagnostic capture fires only once per silent streak.
     private var silentDiagCaptured: Bool = false
+    // Silent-recovery state. A "flat episode" is one continuous run of silent buffers from
+    // the user's perspective, possibly spanning several sessions as recovery restarts tear
+    // them down, so these survive startSession's per-session reset and clear only when a
+    // non-silent buffer arrives. Confined to sampleQueue.
+    //
+    // Mechanism (confirmed 2026-08-31): during an AirPods multipoint handoff, CoreAudio
+    // brings the input device up and delivers zero-filled buffers while bluetoothd has not
+    // yet established the SCO voice link. A fresh AVCaptureSession issues a new audio
+    // routing request to audiomxd, the same kind of request observed to trigger SCO
+    // renegotiation, so restarting the session can end the gap instead of waiting it out.
+    private var flatEpisodeStart: Date?
+    private var silentRecoveryAttempts: Int = 0
+    private var silentRestartPending: Bool = false
+    private let silentRecoveryMaxAttempts = 3
 
     // --- Listener tracking (confined to listenerQueue) ---
     private var perDeviceListeners: [ListenerRegistration] = []
@@ -371,7 +386,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         session = nil
         stopHeartbeat_onSampleQueue()
 
-        // Reset sample state on sampleQueue
+        // Reset sample state on sampleQueue. flatEpisodeStart and silentRecoveryAttempts
+        // deliberately survive: they track a flat episode across restarts.
         sampleQueue.sync {
             sampleCount = 0
             silentSampleCount = 0
@@ -379,6 +395,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
             silentStreakStart = nil
             lastSampleTime = nil
             silentDiagCaptured = false
+            silentRestartPending = false
         }
 
         sessionStartTime = Date()
@@ -394,6 +411,12 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         currentDeviceID = getAllAudioDeviceIDs().first {
             getStringProperty($0, selector: kAudioDevicePropertyDeviceUID) == device.uniqueID
         } ?? 0
+
+        let transport: UInt32 = currentDeviceID > 0
+            ? (getAudioProperty(currentDeviceID, selector: kAudioDevicePropertyTransportType) ?? 0)
+            : 0
+        currentDeviceIsBluetooth = transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
 
         log("[session-\(sid)] Opening device: \(device.localizedName) [id=\(currentDeviceID)]")
 
@@ -455,6 +478,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                 if isSilent {
                     silentSampleCount += 1
                     if silentStreakStart == nil { silentStreakStart = Date() }
+                    if flatEpisodeStart == nil { flatEpisodeStart = silentStreakStart }
+                    maybeRestartForSilence_onSampleQueue()
                 } else {
                     if let start = silentStreakStart {
                         let duration = Date().timeIntervalSince(start)
@@ -467,6 +492,16 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                             DispatchQueue.global(qos: .utility).async { logAllDevices(prefix: "[recovery-diag]") }
                         }
                     }
+                    // Episode summary: the fix-effectiveness metric. Total user-perceived gap
+                    // (across any restarts) and how many restarts it took to end it.
+                    if let epStart = flatEpisodeStart {
+                        let total = Date().timeIntervalSince(epStart)
+                        if total > 2.0 || silentRecoveryAttempts > 0 {
+                            log("[silent-recovery] Audio restored on session-\(sessionID): flat episode \(String(format: "%.1f", total))s total, \(silentRecoveryAttempts) restart(s)")
+                        }
+                    }
+                    flatEpisodeStart = nil
+                    silentRecoveryAttempts = 0
                     lastSilentSampleCount = silentSampleCount
                     silentStreakStart = nil
                     silentDiagCaptured = false
@@ -479,6 +514,40 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                        didDrop sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         log("[session-\(sessionID)] *** DROPPED FRAME (total samples: \(sampleCount))")
+    }
+
+    // MARK: - Silent recovery (runs on sampleQueue)
+
+    // Give bluetoothd progressively longer to finish SCO setup before poking it again.
+    private func silentRecoveryThreshold(forAttempt attempt: Int) -> TimeInterval {
+        return 4.0 + Double(attempt) * 2.0  // 4s, 6s, 8s
+    }
+
+    private func maybeRestartForSilence_onSampleQueue() {
+        // Bluetooth only: the confirmed flat mechanism is the SCO handoff gap. All-zero
+        // buffers on the built-in mic mean something else (e.g. input mute) where a
+        // restart would just churn.
+        guard currentDeviceIsBluetooth, !silentRestartPending,
+              silentRecoveryAttempts < silentRecoveryMaxAttempts,
+              let start = silentStreakStart else { return }
+        let streak = Date().timeIntervalSince(start)
+        guard streak >= silentRecoveryThreshold(forAttempt: silentRecoveryAttempts) else { return }
+
+        // Grab the onset evidence before tearing the session down. `log show --last` is
+        // retrospective, so capturing here still covers the onset. Once per episode.
+        if !silentDiagCaptured && silentRecoveryAttempts == 0 {
+            silentDiagCaptured = true
+            DispatchQueue.global(qos: .utility).async { logAllDevices(prefix: "[flat-diag]") }
+            captureSystemAudioBTLog(reason: "SIGNAL FLAT onset session-\(sessionID) (pre-restart)", seconds: 45)
+        }
+
+        silentRecoveryAttempts += 1
+        silentRestartPending = true
+        log("[silent-recovery] *** Silent for \(String(format: "%.1f", streak))s on session-\(sessionID); restarting session (attempt \(silentRecoveryAttempts)/\(silentRecoveryMaxAttempts))")
+        if silentRecoveryAttempts == silentRecoveryMaxAttempts {
+            log("[silent-recovery] Attempt cap reached; further recovery waits for the link to come back on its own")
+        }
+        sessionQueue.async { self.startSession_onSessionQueue() }
     }
 
     // MARK: - Heartbeat (runs on sampleQueue)
@@ -529,11 +598,12 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                     let silentInfo = silentDelta > 0 ? ", silent=\(silentDelta)/\(delta)" : ""
                     if let start = self.silentStreakStart {
                         let streakDur = Date().timeIntervalSince(start)
-                        log("[session-\(sid)] *** HEARTBEAT: SIGNAL FLAT for \(String(format: "%.1f", streakDur))s (+\(delta) samples, \(silentDelta) silent, alive=\(isAlive), devRunning=\(devRunning), runningSomewhere=\(runningSomewhere), hogPID=\(hogPID))")
+                        log("[session-\(sid)] *** HEARTBEAT: SIGNAL FLAT for \(String(format: "%.1f", streakDur))s (+\(delta) samples, \(silentDelta) silent, restarts=\(self.silentRecoveryAttempts), alive=\(isAlive), devRunning=\(devRunning), runningSomewhere=\(runningSomewhere), hogPID=\(hogPID))")
                         log("[session-\(sid)] [flat-diag] input format: \(inputStreamFormatDescription(deviceID))")
-                        // Fire the heavy capture once per streak, at first detection, so we grab the
-                        // SCO/HFP transition that produced the silence before the unified log rotates out.
-                        if !self.silentDiagCaptured {
+                        // Fire the heavy capture once per episode, at first detection, so we grab the
+                        // SCO/HFP transition that produced the silence before the unified log rotates
+                        // out. Post-restart sessions (attempts > 0) already captured the onset.
+                        if !self.silentDiagCaptured && self.silentRecoveryAttempts == 0 {
                             self.silentDiagCaptured = true
                             DispatchQueue.global(qos: .utility).async { logAllDevices(prefix: "[flat-diag]") }
                             captureSystemAudioBTLog(reason: "SIGNAL FLAT onset session-\(sid)", seconds: 45)
@@ -847,7 +917,8 @@ sigusr1Source.setEventHandler {
 }
 sigusr1Source.resume()
 
-log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.10.2)")
+log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.11.0)")
+log("[silent-recovery] Enabled: restart Bluetooth session after 4s of silent buffers (max 3 attempts/episode)")
 log("[bt-capture] Flat-signal Bluetooth/coreaudio diagnostics enabled -> \(btLogPath)")
 log("[bt-capture] Manual trigger: kill -USR1 \(ProcessInfo.processInfo.processIdentifier)")
 keeper.start()
