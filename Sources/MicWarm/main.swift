@@ -682,6 +682,6 @@ func installSignalHandlers() {
 }
 
 installSignalHandlers()
-log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.9.2)")
+log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.9.3)")
 keeper.start()
 dispatchMain()
