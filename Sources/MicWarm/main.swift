@@ -34,6 +34,38 @@ func getAudioProperty<T>(_ objectID: AudioObjectID, selector: AudioObjectPropert
     return value.pointee
 }
 
+func allowSystemIdleSleep() {
+    let systemObject = AudioObjectID(kAudioObjectSystemObject)
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertySleepingIsAllowed,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var allowSleep: UInt32 = 1
+
+    let status = AudioObjectSetPropertyData(
+        systemObject,
+        &address,
+        0,
+        nil,
+        UInt32(MemoryLayout<UInt32>.size),
+        &allowSleep)
+
+    guard status == noErr else {
+        log("[power] Could not allow system idle sleep (OSStatus: \(status))")
+        return
+    }
+
+    let configuredValue: UInt32? = getAudioProperty(
+        systemObject,
+        selector: kAudioHardwarePropertySleepingIsAllowed)
+    guard configuredValue == 1 else {
+        log("[power] Could not verify that system idle sleep is allowed")
+        return
+    }
+
+    log("[power] System idle sleep allowed during microphone capture")
+}
+
 func getStringProperty(_ objectID: AudioObjectID, selector: AudioObjectPropertySelector) -> String? {
     var address = AudioObjectPropertyAddress(mSelector: selector,
                                               mScope: kAudioObjectPropertyScopeGlobal,
@@ -436,6 +468,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 
         log("[session-\(sid)] Starting session...")
         s.startRunning()
+        // Reapply after every start so device changes and recovery remain sleep-safe.
+        allowSystemIdleSleep()
         session = s
         log("[session-\(sid)] Keeping warm: \(device.localizedName) (isRunning=\(s.isRunning))")
         log("[session-\(sid)] Input format at start: \(inputStreamFormatDescription(currentDeviceID))")
