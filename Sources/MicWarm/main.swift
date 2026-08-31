@@ -951,7 +951,7 @@ sigusr1Source.setEventHandler {
 }
 sigusr1Source.resume()
 
-log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.11.0)")
+log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.11.1)")
 log("[silent-recovery] Enabled: restart Bluetooth session after 4s of silent buffers (max 3 attempts/episode)")
 log("[bt-capture] Flat-signal Bluetooth/coreaudio diagnostics enabled -> \(btLogPath)")
 log("[bt-capture] Manual trigger: kill -USR1 \(ProcessInfo.processInfo.processIdentifier)")
