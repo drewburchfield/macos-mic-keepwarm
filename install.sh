@@ -16,13 +16,8 @@ echo "Installing mic-warm..."
 if [ -f "$PLIST_PATH" ] && grep -q "keep-mic-warm.sh" "$PLIST_PATH" 2>/dev/null; then
     echo "Migrating from legacy shell script..."
     launchctl unload "$PLIST_PATH" 2>/dev/null || true
-    # Kill any leftover ffmpeg from the old method
-    if [ -f /tmp/mic-warm.pid ]; then
-        OLD_PID=$(cat /tmp/mic-warm.pid 2>/dev/null || true)
-        [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
-    fi
-    pkill -f "ffmpeg.*avfoundation.*:0.*null" 2>/dev/null || true
-    rm -f /tmp/mic-warm.pid /tmp/mic-warm.log
+    # launchd stops the legacy job and its children. Do not signal a PID read
+    # from /tmp or match unrelated ffmpeg processes by command line.
     echo "Old method stopped."
 fi
 
