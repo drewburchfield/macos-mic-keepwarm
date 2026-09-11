@@ -14,7 +14,6 @@ else
     echo "mic-warm is not installed (no plist found)."
 fi
 
-rm -f /tmp/mic-warm.pid
 rm -f /tmp/mic-warm.log
 
 if [ -f "$HOME/.local/bin/mic-warm" ]; then

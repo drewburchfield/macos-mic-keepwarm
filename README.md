@@ -123,13 +123,22 @@ You don't need one. BlackHole, Loopback, and SoundFlower create virtual audio ro
 
 ## Testing
 
-Run the integration test suite to verify process lifecycle, signal handling, and PID file management:
+Run `./test-instance-lock.sh` for instance-lock regression tests (only Command Line Tools required; no microphone access).
+
+Run the integration suite with microphone permission and no other native mic-warm instance running to verify capture, duplicate launches, signal handling, and automatic lock release:
 
 ```bash
 ./test.sh
 ```
 
 Device-switching tests require real audio hardware and should be done manually.
+
+### Instance safety
+
+The native helper holds an exclusive file lock at `~/Library/Caches/mic-warm.lock`, resolving the home directory from the current user account. A second instance exits without stopping the first. The lock is released by macOS when the process exits, including after a crash; the empty lock file is intentionally retained. No PID is read from a shared file or used to terminate another process. Stop a running instance before starting a replacement.
+
+The legacy shell fallback only stops its own ffmpeg child. When migrating a manually started legacy helper, stop that shell yourself; the installer only unloads the managed launchd job.
+
 
 ## Legacy Shell Script
 

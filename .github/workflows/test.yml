@@ -1,0 +1,20 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instance-lock regression tests (no microphone required)
+        run: ./test-instance-lock.sh
+      - name: Check shell syntax
+        run: bash -n install.sh uninstall.sh keep-mic-warm.sh test.sh test-instance-lock.sh
+      - name: Build universal binary
+        run: swift build -c release --arch arm64 --arch x86_64

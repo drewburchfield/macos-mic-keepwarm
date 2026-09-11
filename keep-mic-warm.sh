@@ -35,7 +35,6 @@ cleanup() {
     if [ -n "$FFMPEG_PID" ] && kill -0 "$FFMPEG_PID" 2>/dev/null; then
         kill "$FFMPEG_PID" 2>/dev/null
     fi
-    rm -f /tmp/mic-warm.pid
     exit 0
 }
 trap cleanup EXIT INT TERM
@@ -65,7 +64,6 @@ stop_ffmpeg() {
         fi
         FFMPEG_PID=""
     fi
-    rm -f /tmp/mic-warm.pid
 }
 
 start_ffmpeg() {
@@ -74,26 +72,15 @@ start_ffmpeg() {
     FFMPEG_PID=$!
     sleep 0.5
     if kill -0 "$FFMPEG_PID" 2>/dev/null; then
-        echo "$FFMPEG_PID" > /tmp/mic-warm.pid
         return 0
     else
         log "ffmpeg process exited immediately"
         FFMPEG_PID=""
-        rm -f /tmp/mic-warm.pid
         return 1
     fi
 }
 
-# Kill any stale instance from a previous run
-if [ -f /tmp/mic-warm.pid ]; then
-    OLD_PID=$(cat /tmp/mic-warm.pid)
-    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
-        log "Killing stale ffmpeg (PID: $OLD_PID)"
-        kill "$OLD_PID" 2>/dev/null || true
-        sleep 0.5
-    fi
-    rm -f /tmp/mic-warm.pid
-fi
+# Only manage the ffmpeg child started by this shell; never trust a shared PID file.
 
 # Wait for audio subsystem to be ready
 CURRENT_DEVICE=""

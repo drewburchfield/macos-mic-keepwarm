@@ -147,36 +147,6 @@ func logAllDevices(prefix: String) {
     }
 }
 
-// MARK: - PID file
-
-let pidPath = "/tmp/mic-warm.pid"
-
-func writePID() {
-    do {
-        try "\(ProcessInfo.processInfo.processIdentifier)".write(
-            toFile: pidPath, atomically: true, encoding: .utf8)
-    } catch {
-        log("Warning: Could not write PID file \(pidPath): \(error.localizedDescription)")
-    }
-}
-
-func cleanupPID() {
-    unlink(pidPath)
-}
-
-func killStalePID() {
-    guard let contents = try? String(contentsOfFile: pidPath, encoding: .utf8),
-          let old = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)),
-          old != ProcessInfo.processInfo.processIdentifier
-    else { return }
-    if kill(old, 0) == 0 {
-        log("Killing stale process (PID: \(old))")
-        kill(old, SIGTERM)
-        usleep(500_000)
-    }
-    cleanupPID()
-}
-
 // MARK: - Capture session
 
 class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
@@ -194,9 +164,6 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private var currentDeviceID: AudioDeviceID = 0
 
     func start() {
-        killStalePID()
-        writePID()
-
         #if false // Enable for instrumented debugging
         log("=== STARTUP DEVICE SNAPSHOT ===")
         logAllDevices(prefix: "[startup]")
@@ -648,20 +615,12 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         }
     }
 
-    func signalShutdown() {
-        // Skip stopRunning() here: it can deadlock on Bluetooth devices, and
-        // _exit(0) follows immediately so the OS reclaims all resources.
-        session = nil
-        cleanupPID()
-    }
-
     func shutdown() {
         debounceWork?.cancel()
         stopHeartbeat()
         // Skip stopRunning(): it can deadlock on Bluetooth devices.
         // Process exit reclaims all resources.
         session = nil
-        cleanupPID()
         log("Shutdown complete")
     }
 }
@@ -674,11 +633,23 @@ func installSignalHandlers() {
     let handler: @convention(c) (Int32) -> Void = { sig in
         signal(SIGTERM, SIG_DFL)
         signal(SIGINT, SIG_DFL)
-        keeper.signalShutdown()
+        // The kernel releases the microphone and instance lock on exit.
+        // Avoid Swift/Foundation operations inside a POSIX signal handler.
         _exit(0)
     }
     signal(SIGTERM, handler)
     signal(SIGINT, handler)
+}
+
+let instanceLock: InstanceLock
+do {
+    instanceLock = try InstanceLock()
+} catch InstanceLock.Failure.alreadyRunning {
+    log("Another mic-warm instance is already running; exiting without stopping it")
+    exit(0)
+} catch {
+    log("Error: Could not acquire instance lock: \(error)")
+    exit(1)
 }
 
 installSignalHandlers()
