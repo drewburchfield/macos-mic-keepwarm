@@ -64,15 +64,17 @@ The previous approach used ffmpeg from Homebrew. It worked, but every `brew upgr
 
 ### How It Works
 
-`mic-warm` uses `AVCaptureSession` with an audio data output to hold the default microphone open. Audio samples are captured and immediately discarded. Nothing is recorded, stored, or transmitted. The only effect is that the microphone hardware stays awake and the Bluetooth audio channel stays negotiated.
+`mic-warm` uses `AVCaptureSession` with an audio data output to hold the default microphone open. Audio samples are captured and immediately discarded. No audio is recorded, stored, or transmitted. The only effect is that the microphone hardware stays awake and the Bluetooth audio channel stays negotiated.
 
 When you connect or disconnect AirPods, a Bluetooth headset, or any audio device, a CoreAudio property listener fires instantly and the session restarts on the new device after a 3-second debounce window (to let Bluetooth handoffs settle).
 
 **Bluetooth resilience:** When AirPods disconnect, `AVCaptureSession.stopRunning()` can deadlock because CoreAudio's `HALB_Guard` waits on a condition variable for the now-dead Bluetooth device. mic-warm handles this by tearing down the audio pipeline first (releasing the CMIO semaphore that coreaudiod depends on), then dispatching `stopRunning()` to a background thread so a hung Bluetooth teardown is a leaked thread, not a frozen process. A heartbeat timer detects stalled or zero-sample sessions and automatically restarts them.
 
+**Silent recovery:** During an AirPods multipoint handoff, CoreAudio can report the mic as running while the Bluetooth voice link carries only silence, sometimes for over a minute. When a Bluetooth input delivers 4 seconds of all-zero buffers, mic-warm restarts its capture session, which prompts macOS to renegotiate the link. It retries after 6s and 8s, up to 3 times per episode. In testing, this cut the typical gap from 84 seconds to about 4.
+
 - CPU usage: ~0%
 - Battery impact: negligible
-- Privacy: no audio is captured or stored anywhere
+- Privacy: no audio is stored anywhere. Diagnostic logs stay on your Mac (see [Logs](#logs))
 - Works with: built-in mic, AirPods, Bluetooth headsets, USB mics, any input device
 - Instant device-change detection via CoreAudio event listener (no polling)
 - Auto-recovery from Bluetooth disconnects, coreaudiod restarts, and stalled sessions
@@ -94,6 +96,15 @@ macOS will prompt you to grant mic-warm microphone access. Go to System Settings
 ### Upgrade
 
 To upgrade, re-run the install command. The script re-signs the binary and reloads the LaunchAgent. Don't replace the binary manually, as macOS tracks microphone permissions by code signature and will silently reject an unsigned replacement.
+
+### Logs
+
+mic-warm writes to `~/Library/Logs/mic-warm/`:
+
+- `mic-warm.log`: session, device, and recovery events, with a heartbeat every 5 seconds.
+- `bt.log`: excerpts of the macOS Bluetooth and CoreAudio system log, captured when the signal goes flat or recovers. Trigger a capture by hand with `kill -USR1 $(pgrep -f .local/bin/mic-warm)`.
+
+Each file rotates to a single `.1` backup at 10 MB. Run `scripts/check-health.sh` (or `--json`) for a quick health summary. Installs from before v0.11 logged to `/tmp/mic-warm.log`; re-run the installer to move them.
 
 ### Uninstall
 

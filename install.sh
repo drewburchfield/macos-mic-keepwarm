@@ -9,6 +9,10 @@ REPO="drewburchfield/macos-mic-keepwarm"
 BIN_DIR="$HOME/.local/bin"
 BIN_PATH="$BIN_DIR/mic-warm"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.user.keep-mic-warm.plist"
+# Logs live in ~/Library/Logs (persists across reboots, unlike /tmp) alongside the
+# flat-signal Bluetooth capture the binary writes to the same directory.
+LOG_DIR="$HOME/Library/Logs/mic-warm"
+LOG_PATH="$LOG_DIR/mic-warm.log"
 
 echo "Installing mic-warm..."
 
@@ -19,7 +23,10 @@ if [ -f "$PLIST_PATH" ] && grep -q "keep-mic-warm.sh" "$PLIST_PATH" 2>/dev/null;
     # Kill any leftover ffmpeg from the old method
     if [ -f /tmp/mic-warm.pid ]; then
         OLD_PID=$(cat /tmp/mic-warm.pid 2>/dev/null || true)
-        [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
+        # Only signal it if it is still the old ffmpeg, not a process that reused the PID.
+        if [ -n "$OLD_PID" ] && [ "$(ps -p "$OLD_PID" -o comm= 2>/dev/null | xargs basename 2>/dev/null)" = "ffmpeg" ]; then
+            kill "$OLD_PID" 2>/dev/null || true
+        fi
     fi
     pkill -f "ffmpeg.*avfoundation.*:0.*null" 2>/dev/null || true
     rm -f /tmp/mic-warm.pid /tmp/mic-warm.log
@@ -37,6 +44,9 @@ codesign --force --sign - "$BIN_PATH"
 # Unload existing agent if present
 launchctl unload "$PLIST_PATH" 2>/dev/null || true
 
+# Persistent, user-only (0700) log directory, replacing world-writable /tmp
+mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
+
 cat > "$PLIST_PATH" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -53,9 +63,9 @@ cat > "$PLIST_PATH" << EOF
     <key>KeepAlive</key>
     <true/>
     <key>StandardErrorPath</key>
-    <string>/tmp/mic-warm.log</string>
+    <string>${LOG_PATH}</string>
     <key>StandardOutPath</key>
-    <string>/tmp/mic-warm.log</string>
+    <string>${LOG_PATH}</string>
 </dict>
 </plist>
 EOF
@@ -69,5 +79,6 @@ echo ""
 echo "macOS will prompt you to grant mic-warm microphone access."
 echo "Go to System Settings > Privacy & Security > Microphone and allow it."
 echo ""
-echo "Log file: /tmp/mic-warm.log"
+echo "Log file: $LOG_PATH"
+echo "Flat-signal Bluetooth diagnostics: $LOG_DIR/bt.log"
 echo "To uninstall: curl -fsSL https://raw.githubusercontent.com/drewburchfield/macos-mic-keepwarm/master/uninstall.sh | bash"

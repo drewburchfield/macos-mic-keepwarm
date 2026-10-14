@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: swift build -c release --arch arm64 --arch x86_64
+
+      - name: Unit tests
+        run: swift test
+
+      - name: Integration tests
+        run: ./test.sh
