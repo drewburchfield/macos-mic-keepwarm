@@ -239,6 +239,10 @@ func captureSystemAudioBTLog(reason: String, seconds: Int) {
         // 0700 dir owned by us means no other user can plant a symlink to redirect our writes.
         try? fm.createDirectory(atPath: btLogDir, withIntermediateDirectories: true,
                                 attributes: [.posixPermissions: 0o700])
+        // Each capture is ~1.5-2MB; keep about the last ten (current file plus bt.log.1).
+        if LogRotation.rotateIfNeeded(btLogPath) {
+            log("[bt-capture] Rotated \(btLogPath) to bt.log.1")
+        }
         if !fm.fileExists(atPath: btLogPath) {
             fm.createFile(atPath: btLogPath, contents: nil, attributes: [.posixPermissions: 0o600])
         }
@@ -956,6 +960,19 @@ sigusr1Source.setEventHandler {
     captureSystemAudioBTLog(reason: "manual SIGUSR1 trigger", seconds: 30)
 }
 sigusr1Source.resume()
+
+// Cap the main log. launchd opens StandardOutPath once and hands us the fds, so the
+// process rotates the file itself: rename to mic-warm.log.1 and point stdout/stderr at a
+// fresh file. A run from a terminal (stdout not that file) is left alone.
+let mainLogPath = (btLogDir as NSString).appendingPathComponent("mic-warm.log")
+let logRotationTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+logRotationTimer.schedule(deadline: .now() + 60, repeating: 60, leeway: .seconds(10))
+logRotationTimer.setEventHandler {
+    if LogRotation.rotateInheritedLog(mainLogPath) {
+        log("[log] Rotated previous log to \(mainLogPath).1 (cap \(LogRotation.maxBytes / 1024 / 1024)MB)")
+    }
+}
+logRotationTimer.resume()
 
 log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.11.1)")
 log("[silent-recovery] Enabled: restart Bluetooth session after 4s of silent buffers (max 3 attempts/episode)")
