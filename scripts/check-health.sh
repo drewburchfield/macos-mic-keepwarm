@@ -1,5 +1,5 @@
 #!/bin/bash
-# check-health.sh - Health check for mic-warm debug build
+# check-health.sh - Health check for the mic-warm daemon
 # Outputs structured findings for human or automated review.
 # Exit codes: 0 = healthy, 1 = issues found, 2 = not running
 #
@@ -9,7 +9,9 @@
 
 set -euo pipefail
 
-LOG="/tmp/mic-warm.log"
+LOG="${MIC_WARM_LOG:-$HOME/Library/Logs/mic-warm/mic-warm.log}"
+# Installs from before v0.11 log to /tmp until install.sh is re-run.
+[[ ! -f "$LOG" && -f /tmp/mic-warm.log ]] && LOG="/tmp/mic-warm.log"
 JSON_MODE=false
 [[ "${1:-}" == "--json" ]] && JSON_MODE=true
 
@@ -17,9 +19,12 @@ issues=()
 warnings=()
 
 # 1. Is the process running?
-PID=$(pgrep -f "mic-warm$" || true)
+PIDS=$(pgrep -f "mic-warm$" || true)
+PID=$(echo "$PIDS" | head -1)
 if [[ -z "$PID" ]]; then
     issues+=("PROCESS_NOT_RUNNING: mic-warm is not running")
+elif [[ $(echo "$PIDS" | wc -l) -gt 1 ]]; then
+    issues+=("MULTIPLE_INSTANCES: $(echo $PIDS) are all running")
 fi
 
 # 2. Is the log file present and recent?
@@ -54,10 +59,24 @@ else
         issues+=("DEADLOCK_WARNING: $deadlock_count deadlock warning(s) in recent log")
     fi
 
-    # Check for signal-flat events
+    # Check for signal-flat events. Silent-recovery ends most of them within seconds, so a
+    # flat episode is an issue only while it is still open or after recovery gave up.
     flat_count=$(echo "$tail_lines" | grep -c "SIGNAL FLAT" || true)
-    if [[ $flat_count -gt 0 ]]; then
-        issues+=("SIGNAL_FLAT: $flat_count 'signal flat' event(s) in recent log - original bug may be reproducing")
+    last_flat=$(echo "$tail_lines" | grep -n "SIGNAL FLAT" | tail -1 | cut -d: -f1 || true)
+    last_restored=$(echo "$tail_lines" | grep -n "\[silent-recovery\] Audio restored\|Silent streak ended" | tail -1 | cut -d: -f1 || true)
+    if [[ -n "$last_flat" && ( -z "$last_restored" || $last_restored -lt $last_flat ) ]]; then
+        issues+=("SIGNAL_FLAT: signal is flat and has not recovered ($flat_count flat heartbeat(s) in recent log)")
+    elif [[ $flat_count -gt 0 ]]; then
+        warnings+=("SIGNAL_FLAT_RECOVERED: $flat_count flat heartbeat(s) in recent log, since recovered")
+    fi
+
+    restored_count=$(echo "$tail_lines" | grep -c "\[silent-recovery\] Audio restored" || true)
+    if [[ $restored_count -gt 0 ]]; then
+        warnings+=("SILENT_RECOVERY: $restored_count flat episode(s) ended in recent log")
+    fi
+    cap_count=$(echo "$tail_lines" | grep -c "\[silent-recovery\] Attempt cap reached" || true)
+    if [[ $cap_count -gt 0 ]]; then
+        warnings+=("RECOVERY_CAP: silent-recovery hit its attempt cap $cap_count time(s); the Bluetooth link may be held by another device")
     fi
 
     # Check for silent streaks
@@ -89,6 +108,17 @@ else
     last_line=$(tail -1 "$LOG")
 fi
 
+# Escape a string for a JSON string literal.
+json_str() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\t'/\\t}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\n'/\\n}
+    printf '"%s"' "$s"
+}
+
 # Output
 if $JSON_MODE; then
     echo "{"
@@ -98,16 +128,17 @@ if $JSON_MODE; then
     echo "  \"status\": \"$([ ${#issues[@]} -eq 0 ] && echo 'healthy' || echo 'unhealthy')\","
     echo "  \"issues\": ["
     for i in "${!issues[@]}"; do
-        echo "    \"${issues[$i]}\"$([ $i -lt $((${#issues[@]}-1)) ] && echo ',')"
+        echo "    $(json_str "${issues[$i]}")$([ $i -lt $((${#issues[@]}-1)) ] && echo ',')"
     done
     echo "  ],"
     echo "  \"warnings\": ["
     for i in "${!warnings[@]}"; do
-        echo "    \"${warnings[$i]}\"$([ $i -lt $((${#warnings[@]}-1)) ] && echo ',')"
+        echo "    $(json_str "${warnings[$i]}")$([ $i -lt $((${#warnings[@]}-1)) ] && echo ',')"
     done
     echo "  ],"
-    echo "  \"last_heartbeat\": \"${last_heartbeat:-none}\","
-    echo "  \"last_log_line\": \"${last_line:-none}\""
+    echo "  \"log_path\": $(json_str "$LOG"),"
+    echo "  \"last_heartbeat\": $(json_str "${last_heartbeat:-none}"),"
+    echo "  \"last_log_line\": $(json_str "${last_line:-none}")"
     echo "}"
 else
     echo "=== mic-warm health check ($(date)) ==="
@@ -117,7 +148,7 @@ else
     else
         echo "Process: NOT RUNNING"
     fi
-    echo "Log age: ${age_seconds:-?}s"
+    echo "Log: $LOG (age ${age_seconds:-?}s)"
     echo ""
 
     if [[ ${#issues[@]} -gt 0 ]]; then

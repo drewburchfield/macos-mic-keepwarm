@@ -41,7 +41,7 @@ codesign --force --sign - "$BIN_PATH"
 # Unload existing agent if present
 launchctl unload "$PLIST_PATH" 2>/dev/null || true
 
-# Persistent log directory (0700: keeps diagnostic logs out of world-writable /tmp)
+# Persistent, user-only (0700) log directory, replacing world-writable /tmp
 mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
 
 cat > "$PLIST_PATH" << EOF
