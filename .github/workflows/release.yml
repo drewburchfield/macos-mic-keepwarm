@@ -17,6 +17,9 @@ jobs:
       - name: Build universal binary
         run: swift build -c release --arch arm64 --arch x86_64
 
+      - name: Run unit tests
+        run: swift test
+
       - name: Ad-hoc sign
         run: codesign --force --sign - .build/apple/Products/Release/mic-warm
 
