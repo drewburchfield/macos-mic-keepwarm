@@ -1010,7 +1010,7 @@ logRotationTimer.setEventHandler {
 }
 logRotationTimer.resume()
 
-log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.11.1)")
+log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.11.2)")
 log("[silent-recovery] Enabled: restart Bluetooth session after \((0..<SilentRecoveryEpisode.maxAttempts).map { "\(Int(SilentRecoveryEpisode.threshold(forAttempt: $0)))s" }.joined(separator: "/")) of silent buffers (max \(SilentRecoveryEpisode.maxAttempts) attempts/episode)")
 log("[bt-capture] Flat-signal Bluetooth/coreaudio diagnostics enabled -> \(btLogPath)")
 log("[bt-capture] Manual trigger: kill -USR1 \(ProcessInfo.processInfo.processIdentifier)")
