@@ -283,10 +283,22 @@ func killStalePID() {
 
 // MARK: - Per-device listener tracking
 
+// Per-device listeners use the C-function API, not AudioObjectAddPropertyListenerBlock.
+// Removing a block listener needs the identical block object, and a Swift closure does not
+// keep that identity across the add and remove calls. The HAL still returns noErr, so every
+// reinstall silently stacked another copy (one property change logged 88 times in the same
+// millisecond after 88 reinstalls). A fixed proc plus clientData pair removes reliably.
 struct ListenerRegistration {
     let deviceID: AudioObjectID
     var address: AudioObjectPropertyAddress
-    let block: AudioObjectPropertyListenerBlock
+}
+
+private let perDeviceListenerProc: AudioObjectPropertyListenerProc = { objectID, count, addresses, clientData in
+    guard let clientData else { return noErr }
+    let keeper = Unmanaged<MicKeeper>.fromOpaque(clientData).takeUnretainedValue()
+    let changed = (0..<Int(count)).map { addresses[$0] }
+    keeper.perDevicePropertiesChanged(objectID, changed)
+    return noErr
 }
 
 // MARK: - Capture session
@@ -340,6 +352,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     // --- Listener tracking (confined to listenerQueue) ---
     private var perDeviceListeners: [ListenerRegistration] = []
+    private var perDeviceNames: [AudioObjectID: String] = [:]
 
     // MARK: - Startup
 
@@ -713,8 +726,24 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         }
     }
 
-    // Per-device property listeners. Dispatched to listenerQueue (not main, not sessionQueue)
-    // to avoid deadlocks. Listeners are tracked for proper cleanup on reinstall.
+    // Per-device property listeners. The HAL calls perDeviceListenerProc on its own thread;
+    // the work hops to listenerQueue (not main, not sessionQueue) to avoid deadlocks.
+    // Listeners are tracked for proper cleanup on reinstall.
+    private static let perDeviceProperties: [(AudioObjectPropertySelector, AudioObjectPropertyScope)] = [
+        (kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal),
+        (kAudioDevicePropertyDeviceIsRunning, kAudioObjectPropertyScopeGlobal),
+        (kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioObjectPropertyScopeGlobal),
+        (kAudioDevicePropertyHogMode, kAudioObjectPropertyScopeGlobal),
+        (kAudioDevicePropertyDataSource, kAudioObjectPropertyScopeInput),
+        (kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal),
+        (kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeInput),
+    ]
+
+    // MicKeeper lives for the whole process, so an unretained pointer is a stable clientData.
+    private var listenerClientData: UnsafeMutableRawPointer {
+        Unmanaged.passUnretained(self).toOpaque()
+    }
+
     private func installPerDeviceListeners() {
         // Clean up old listeners first
         removePerDeviceListeners()
@@ -722,70 +751,71 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         let devices = getAllAudioDeviceIDs()
         listenerQueue.sync { [self] in
             for deviceID in devices {
-                let name = getStringProperty(deviceID, selector: kAudioObjectPropertyName) ?? "?"
-
-                func addListener(_ selector: AudioObjectPropertySelector,
-                                 _ scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
-                                 handler: @escaping () -> Void) {
-                    let block: AudioObjectPropertyListenerBlock = { _, _ in handler() }
+                perDeviceNames[deviceID] = getStringProperty(deviceID, selector: kAudioObjectPropertyName) ?? "?"
+                for (selector, scope) in Self.perDeviceProperties {
                     var addr = AudioObjectPropertyAddress(
                         mSelector: selector, mScope: scope,
                         mElement: kAudioObjectPropertyElementMain)
-                    AudioObjectAddPropertyListenerBlock(deviceID, &addr, listenerQueue, block)
-                    perDeviceListeners.append(ListenerRegistration(
-                        deviceID: deviceID, address: addr, block: block))
-                }
-
-                addListener(kAudioDevicePropertyDeviceIsAlive) {
-                    let alive: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsAlive) ?? 99
-                    log("[device] \(name) [id=\(deviceID)] isAlive changed -> \(alive)")
-                }
-
-                addListener(kAudioDevicePropertyDeviceIsRunning) {
-                    let running: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsRunning) ?? 99
-                    log("[device] \(name) [id=\(deviceID)] isRunning changed -> \(running)")
-                }
-
-                addListener(kAudioDevicePropertyDeviceIsRunningSomewhere) {
-                    let rs: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsRunningSomewhere) ?? 99
-                    log("[device] \(name) [id=\(deviceID)] isRunningSomewhere changed -> \(rs)")
-                }
-
-                addListener(kAudioDevicePropertyHogMode) {
-                    let hog: pid_t = getAudioProperty(deviceID, selector: kAudioDevicePropertyHogMode) ?? -1
-                    log("[device] *** \(name) [id=\(deviceID)] hogMode changed -> PID \(hog)")
-                }
-
-                addListener(kAudioDevicePropertyDataSource, kAudioObjectPropertyScopeInput) {
-                    let src: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDataSource,
-                                                        scope: kAudioObjectPropertyScopeInput) ?? 0
-                    log("[device] \(name) [id=\(deviceID)] input dataSource changed -> \(src)")
-                }
-
-                addListener(kAudioDevicePropertyNominalSampleRate) {
-                    let rate: Float64 = getAudioProperty(deviceID, selector: kAudioDevicePropertyNominalSampleRate) ?? 0
-                    log("[device] \(name) [id=\(deviceID)] sampleRate changed -> \(rate) Hz")
-                }
-
-                addListener(kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeInput) {
-                    log("[device] \(name) [id=\(deviceID)] input stream configuration changed")
+                    let status = AudioObjectAddPropertyListener(
+                        deviceID, &addr, perDeviceListenerProc, listenerClientData)
+                    if status == noErr {
+                        perDeviceListeners.append(ListenerRegistration(deviceID: deviceID, address: addr))
+                    }
                 }
             }
             log("[listeners] Per-device listeners installed for \(devices.count) devices (\(perDeviceListeners.count) total)")
         }
     }
 
+    // Called by perDeviceListenerProc on a HAL thread.
+    fileprivate func perDevicePropertiesChanged(_ deviceID: AudioObjectID,
+                                                _ addresses: [AudioObjectPropertyAddress]) {
+        listenerQueue.async { [self] in
+            let name = perDeviceNames[deviceID] ?? "?"
+            for addr in addresses {
+                switch addr.mSelector {
+                case kAudioDevicePropertyDeviceIsAlive:
+                    let alive: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsAlive) ?? 99
+                    log("[device] \(name) [id=\(deviceID)] isAlive changed -> \(alive)")
+                case kAudioDevicePropertyDeviceIsRunning:
+                    let running: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsRunning) ?? 99
+                    log("[device] \(name) [id=\(deviceID)] isRunning changed -> \(running)")
+                case kAudioDevicePropertyDeviceIsRunningSomewhere:
+                    let rs: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDeviceIsRunningSomewhere) ?? 99
+                    log("[device] \(name) [id=\(deviceID)] isRunningSomewhere changed -> \(rs)")
+                case kAudioDevicePropertyHogMode:
+                    let hog: pid_t = getAudioProperty(deviceID, selector: kAudioDevicePropertyHogMode) ?? -1
+                    log("[device] *** \(name) [id=\(deviceID)] hogMode changed -> PID \(hog)")
+                case kAudioDevicePropertyDataSource:
+                    let src: UInt32 = getAudioProperty(deviceID, selector: kAudioDevicePropertyDataSource,
+                                                        scope: kAudioObjectPropertyScopeInput) ?? 0
+                    log("[device] \(name) [id=\(deviceID)] input dataSource changed -> \(src)")
+                case kAudioDevicePropertyNominalSampleRate:
+                    let rate: Float64 = getAudioProperty(deviceID, selector: kAudioDevicePropertyNominalSampleRate) ?? 0
+                    log("[device] \(name) [id=\(deviceID)] sampleRate changed -> \(rate) Hz")
+                case kAudioDevicePropertyStreamConfiguration:
+                    log("[device] \(name) [id=\(deviceID)] input stream configuration changed")
+                default:
+                    break
+                }
+            }
+        }
+    }
+
     private func removePerDeviceListeners() {
         listenerQueue.sync { [self] in
             if perDeviceListeners.isEmpty { return }
+            // Removal fails with kAudioHardwareBadObjectError for devices that already went
+            // away; the HAL drops their listeners with the device, so that count is expected.
             var removed = 0
             for var reg in perDeviceListeners {
-                let status = AudioObjectRemovePropertyListenerBlock(
-                    reg.deviceID, &reg.address, listenerQueue, reg.block)
+                let status = AudioObjectRemovePropertyListener(
+                    reg.deviceID, &reg.address, perDeviceListenerProc, listenerClientData)
                 if status == noErr { removed += 1 }
             }
             log("[listeners] Removed \(removed)/\(perDeviceListeners.count) per-device listeners")
             perDeviceListeners.removeAll()
+            perDeviceNames.removeAll()
         }
     }
 
