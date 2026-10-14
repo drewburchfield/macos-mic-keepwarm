@@ -76,9 +76,20 @@ start_binary() {
     TEST_PID=$!
 }
 
-# Exit 0 if nobody holds the lock (lockf uses flock; -k keeps the file).
+# flock(2) helpers. Python, because lockf(1) is missing on older macOS runners.
+FLOCK_PY='import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+time.sleep(float(sys.argv[2]))'
+
+# Exit 0 if nobody holds the lock.
 lock_is_free() {
-    lockf -k -t 0 "$LOCK" true 2>/dev/null
+    python3 -c "$FLOCK_PY" "$LOCK" 0 2>/dev/null
+}
+
+# Hold the lock in the background from a process that is not mic-warm.
+hold_lock() {
+    python3 -c "$FLOCK_PY" "$LOCK" "$1" &
 }
 
 wait_for_log() {
@@ -222,7 +233,7 @@ test_new_instance_replaces_running_one() {
 
 test_foreign_lock_holder_is_not_killed() {
     # Something that is not mic-warm holds the lock: wait, then give up without signalling it.
-    lockf -k "$LOCK" sleep 30 &
+    hold_lock 30
     local holder=$!
     disown
     EXTRA_PIDS+=("$holder")
