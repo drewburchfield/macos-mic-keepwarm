@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: swift build -c release --arch arm64 --arch x86_64
+
+      # test.sh is left to the release workflow: it starts the daemon.
+      - name: Unit tests
+        run: swift test
