@@ -110,7 +110,9 @@ fi
 
 # Escape a string for a JSON string literal.
 json_str() {
-    local s=$1
+    # Drop control characters JSON cannot carry raw (tab, LF and CR are escaped below).
+    local s
+    s=$(printf '%s' "$1" | LC_ALL=C tr -d '\000-\010\013\014\016-\037')
     s=${s//\\/\\\\}
     s=${s//\"/\\\"}
     s=${s//$'\t'/\\t}

@@ -240,8 +240,15 @@ func captureSystemAudioBTLog(reason: String, seconds: Int) {
                 }
             }
         }
-        proc.waitUntilExit()
-        let status = proc.terminationStatus
+        // EOF on the pipe normally means log show has exited; bound the wait anyway.
+        let exitDeadline = Date().addingTimeInterval(5)
+        while proc.isRunning && Date() < exitDeadline { usleep(50_000) }
+        if proc.isRunning {
+            kill(proc.processIdentifier, SIGKILL)
+            usleep(200_000)
+        }
+        // terminationStatus raises if the process is still running.
+        let status = proc.isRunning ? -1 : proc.terminationStatus
         if !timedOut && status != 0 {
             log("[bt-capture] log show failed (status \(status)); its output is saved below :: \(reason)")
         }
