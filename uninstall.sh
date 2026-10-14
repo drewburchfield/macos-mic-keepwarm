@@ -17,6 +17,7 @@ fi
 rm -f /tmp/mic-warm.pid
 rm -f /tmp/mic-warm.log
 rm -rf "$HOME/Library/Logs/mic-warm"
+rm -rf "$HOME/Library/Application Support/mic-warm"
 
 if [ -f "$HOME/.local/bin/mic-warm" ]; then
     rm -f "$HOME/.local/bin/mic-warm"

@@ -290,34 +290,43 @@ func captureSystemAudioBTLog(reason: String, seconds: Int) {
     }
 }
 
-// MARK: - PID file
+// MARK: - Single instance
 
-let pidPath = "/tmp/mic-warm.pid"
+// One mic-warm per user. A new instance replaces a running one, but only signals a process
+// that holds the lock and whose executable is mic-warm (see InstanceLock). The old
+// /tmp/mic-warm.pid scheme trusted any PID in a world-writable file and could SIGTERM an
+// unrelated process after PID reuse.
+let instanceLockPath = ProcessInfo.processInfo.environment["MIC_WARM_LOCK"]
+    ?? (NSHomeDirectory() as NSString).appendingPathComponent("Library/Application Support/mic-warm/mic-warm.lock")
+let instanceLock = InstanceLock(path: instanceLockPath)
 
-func writePID() {
-    do {
-        try "\(ProcessInfo.processInfo.processIdentifier)".write(
-            toFile: pidPath, atomically: true, encoding: .utf8)
-    } catch {
-        log("Warning: Could not write PID file \(pidPath): \(error.localizedDescription)")
+func acquireInstanceLock() {
+    let deadline = Date().addingTimeInterval(5)
+    var signalled = false
+    while true {
+        switch instanceLock.tryAcquire() {
+        case .acquired:
+            return
+        case .failed(let err):
+            log("Warning: instance lock \(instanceLockPath) unavailable (\(err)); continuing without it")
+            return
+        case .held(let owner):
+            if !signalled {
+                signalled = true
+                if let owner, InstanceLock.isMicWarmProcess(owner) {
+                    log("Replacing running instance (PID: \(owner))")
+                    kill(owner, SIGTERM)
+                } else {
+                    log("Instance lock is held by \(owner.map { "PID \($0)" } ?? "an unknown process"), which is not mic-warm; waiting for it")
+                }
+            }
+            if Date() >= deadline {
+                log("Error: another process still holds \(instanceLockPath); exiting")
+                exit(1)
+            }
+            usleep(100_000)
+        }
     }
-}
-
-func cleanupPID() {
-    unlink(pidPath)
-}
-
-func killStalePID() {
-    guard let contents = try? String(contentsOfFile: pidPath, encoding: .utf8),
-          let old = Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)),
-          old != ProcessInfo.processInfo.processIdentifier
-    else { return }
-    if kill(old, 0) == 0 {
-        log("Killing stale process (PID: \(old))")
-        kill(old, SIGTERM)
-        usleep(500_000)
-    }
-    cleanupPID()
 }
 
 // MARK: - Per-device listener tracking
@@ -386,8 +395,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     // MARK: - Startup
 
     func start() {
-        killStalePID()
-        writePID()
+        acquireInstanceLock()
 
         log("=== STARTUP DEVICE SNAPSHOT ===")
         logAllDevices(prefix: "[startup]")
@@ -953,20 +961,9 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     func signalShutdown() {
         // Skip stopRunning() here: it can deadlock on Bluetooth devices, and
-        // _exit(0) follows immediately so the OS reclaims all resources.
+        // _exit(0) follows immediately so the OS reclaims all resources (the
+        // instance lock included).
         session = nil
-        cleanupPID()
-    }
-
-    func shutdown() {
-        debounceWork?.cancel()
-        stopHeartbeat_onSampleQueue()
-        removePerDeviceListeners()
-        // Skip stopRunning(): it can deadlock on Bluetooth devices.
-        // Process exit reclaims all resources.
-        session = nil
-        cleanupPID()
-        log("Shutdown complete")
     }
 }
 

@@ -23,7 +23,10 @@ if [ -f "$PLIST_PATH" ] && grep -q "keep-mic-warm.sh" "$PLIST_PATH" 2>/dev/null;
     # Kill any leftover ffmpeg from the old method
     if [ -f /tmp/mic-warm.pid ]; then
         OLD_PID=$(cat /tmp/mic-warm.pid 2>/dev/null || true)
-        [ -n "$OLD_PID" ] && kill "$OLD_PID" 2>/dev/null || true
+        # Only signal it if it is still the old ffmpeg, not a process that reused the PID.
+        if [ -n "$OLD_PID" ] && [ "$(ps -p "$OLD_PID" -o comm= 2>/dev/null | xargs basename 2>/dev/null)" = "ffmpeg" ]; then
+            kill "$OLD_PID" 2>/dev/null || true
+        fi
     fi
     pkill -f "ffmpeg.*avfoundation.*:0.*null" 2>/dev/null || true
     rm -f /tmp/mic-warm.pid /tmp/mic-warm.log

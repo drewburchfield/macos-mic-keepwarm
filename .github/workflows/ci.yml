@@ -14,6 +14,8 @@ jobs:
       - name: Build
         run: swift build -c release --arch arm64 --arch x86_64
 
-      # test.sh is left to the release workflow: it starts the daemon.
       - name: Unit tests
         run: swift test
+
+      - name: Integration tests
+        run: ./test.sh
