@@ -61,8 +61,10 @@ else
 
     # Check for signal-flat events. Silent-recovery ends most of them within seconds, so a
     # flat episode is an issue only while it is still open or after recovery gave up.
-    flat_count=$(echo "$tail_lines" | grep -c "SIGNAL FLAT" || true)
-    last_flat=$(echo "$tail_lines" | grep -n "SIGNAL FLAT" | tail -1 | cut -d: -f1 || true)
+    # Match the heartbeat line only: bt-capture lines also carry "SIGNAL FLAT onset" and can
+    # finish after the audio came back.
+    flat_count=$(echo "$tail_lines" | grep -c "HEARTBEAT: SIGNAL FLAT" || true)
+    last_flat=$(echo "$tail_lines" | grep -n "HEARTBEAT: SIGNAL FLAT" | tail -1 | cut -d: -f1 || true)
     last_restored=$(echo "$tail_lines" | grep -n "\[silent-recovery\] Audio restored\|Silent streak ended" | tail -1 | cut -d: -f1 || true)
     if [[ -n "$last_flat" && ( -z "$last_restored" || $last_restored -lt $last_flat ) ]]; then
         issues+=("SIGNAL_FLAT: signal is flat and has not recovered ($flat_count flat heartbeat(s) in recent log)")

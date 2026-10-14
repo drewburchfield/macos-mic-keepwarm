@@ -37,6 +37,12 @@ final class LogRotationTests: XCTestCase {
         XCTAssertEqual(contents(path + ".1")?.count, 200)
     }
 
+    func testRotatesWhenTheNextAppendWouldPassTheLimit() throws {
+        try String(repeating: "x", count: 60).write(toFile: path, atomically: false, encoding: .utf8)
+        XCTAssertEqual(LogRotation.rotateIfNeeded(path, limit: 100, incoming: 40), .notNeeded)
+        XCTAssertEqual(LogRotation.rotateIfNeeded(path, limit: 100, incoming: 41), .rotated)
+    }
+
     func testMissingFileIsNotAnError() {
         XCTAssertEqual(LogRotation.rotateIfNeeded(path, limit: 100), .notNeeded)
     }

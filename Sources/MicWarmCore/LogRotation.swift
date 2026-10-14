@@ -13,11 +13,12 @@ public enum LogRotation {
         case failed(String)
     }
 
-    /// Renames `path` to `path.1` (replacing any previous `.1`) when it exceeds `limit`.
+    /// Renames `path` to `path.1` (replacing any previous `.1`) when it exceeds `limit`, or
+    /// when appending `incoming` more bytes would.
     @discardableResult
-    public static func rotateIfNeeded(_ path: String, limit: off_t = maxBytes) -> Result {
+    public static func rotateIfNeeded(_ path: String, limit: off_t = maxBytes, incoming: off_t = 0) -> Result {
         var st = stat()
-        guard stat(path, &st) == 0, st.st_size > limit else { return .notNeeded }
+        guard stat(path, &st) == 0, st.st_size > 0, st.st_size + incoming > limit else { return .notNeeded }
         return rename(path, path + ".1") == 0 ? .rotated : failure("rename")
     }
 

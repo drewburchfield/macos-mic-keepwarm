@@ -260,7 +260,14 @@ func captureSystemAudioBTLog(reason: String, seconds: Int) {
             try fm.createDirectory(atPath: btLogDir, withIntermediateDirectories: true,
                                    attributes: [.posixPermissions: 0o700])
             // Each capture is ~1.5-2MB; bt.log plus bt.log.1 keep roughly the last 5-10.
-            switch LogRotation.rotateIfNeeded(btLogPath) {
+            // An unusually large capture keeps only its newest bytes, so no file passes the cap.
+            let headerData = Data(header.utf8)
+            let room = Int(LogRotation.maxBytes) - headerData.count
+            let body = data.count > room ? data.suffix(room) : data
+            if body.count < data.count {
+                log("[bt-capture] Capture of \(data.count) bytes exceeds the cap; keeping the last \(body.count)")
+            }
+            switch LogRotation.rotateIfNeeded(btLogPath, incoming: off_t(headerData.count + body.count)) {
             case .rotated: log("[bt-capture] Rotated \(btLogPath) to bt.log.1")
             case .failed(let err): log("[bt-capture] WARNING: rotating \(btLogPath) failed: \(err)")
             case .notNeeded: break
@@ -274,9 +281,9 @@ func captureSystemAudioBTLog(reason: String, seconds: Int) {
             let fh = try FileHandle(forWritingTo: URL(fileURLWithPath: btLogPath))
             defer { try? fh.close() }
             try fh.seekToEnd()
-            try fh.write(contentsOf: Data(header.utf8))
-            try fh.write(contentsOf: data)
-            log("[bt-capture] Wrote \(data.count) bytes to \(btLogPath)\(timedOut ? " (partial)" : "") :: \(reason)")
+            try fh.write(contentsOf: headerData)
+            try fh.write(contentsOf: body)
+            log("[bt-capture] Wrote \(body.count) bytes to \(btLogPath)\(timedOut ? " (partial)" : "") :: \(reason)")
         } catch {
             log("[bt-capture] FAILED to write \(btLogPath): \(error.localizedDescription) :: \(reason)")
         }
@@ -535,40 +542,33 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 
         // Check if audio buffer contains only silence (all zeros).
         // This detects "signal goes flat" where samples keep flowing but are empty.
-        if let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) {
-            // The pointer is valid only for lengthAtOffset bytes (the first contiguous span).
-            var length = 0
-            var dataPointer: UnsafeMutablePointer<Int8>?
-            if CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: &length,
-                                           totalLengthOut: nil, dataPointerOut: &dataPointer) == noErr,
-               let ptr = dataPointer, length > 0 {
-                let isSilent = UnsafeRawBufferPointer(start: ptr, count: length).allSatisfy { $0 == 0 }
-                if isSilent {
-                    silentSampleCount += 1
-                    if silentStreakStart == nil { silentStreakStart = Date() }
-                    if let streakStart = silentStreakStart { flatEpisode.silentBuffer(streakStart: streakStart) }
-                    maybeRestartForSilence_onSampleQueue()
-                } else {
-                    if let start = silentStreakStart {
-                        let duration = Date().timeIntervalSince(start)
-                        if duration > 2.0 {
-                            log("[session-\(sessionID)] Silent streak ended: \(String(format: "%.1f", duration))s (\(silentSampleCount - lastSilentSampleCount) silent buffers)")
-                            log("[session-\(sessionID)] [recovery-diag] input format: \(inputStreamFormatDescription(currentDeviceID))")
-                            // Capture the BT/coreaudio transition that RESTORED audio. Cover the whole
-                            // streak plus a margin so the recovery event is included; compare vs onset.
-                            captureSystemAudioBTLog(reason: "SIGNAL recovered session-\(sessionID) after \(String(format: "%.1f", duration))s", seconds: min(Int(duration) + 15, 200))
-                            DispatchQueue.global(qos: .utility).async { logAllDevices(prefix: "[recovery-diag]") }
-                        }
+        if let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer),
+           let isSilent = AudioSilence.isAllZero(blockBuffer) {
+            if isSilent {
+                silentSampleCount += 1
+                if silentStreakStart == nil { silentStreakStart = Date() }
+                if let streakStart = silentStreakStart { flatEpisode.silentBuffer(streakStart: streakStart) }
+                maybeRestartForSilence_onSampleQueue()
+            } else {
+                if let start = silentStreakStart {
+                    let duration = Date().timeIntervalSince(start)
+                    if duration > 2.0 {
+                        log("[session-\(sessionID)] Silent streak ended: \(String(format: "%.1f", duration))s (\(silentSampleCount - lastSilentSampleCount) silent buffers)")
+                        log("[session-\(sessionID)] [recovery-diag] input format: \(inputStreamFormatDescription(currentDeviceID))")
+                        // Capture the BT/coreaudio transition that RESTORED audio. Cover the whole
+                        // streak plus a margin so the recovery event is included; compare vs onset.
+                        captureSystemAudioBTLog(reason: "SIGNAL recovered session-\(sessionID) after \(String(format: "%.1f", duration))s", seconds: min(Int(duration) + 15, 200))
+                        DispatchQueue.global(qos: .utility).async { logAllDevices(prefix: "[recovery-diag]") }
                     }
-                    // Episode summary: the fix-effectiveness metric. Total user-perceived gap
-                    // (across any restarts) and how many restarts it took to end it.
-                    if let summary = flatEpisode.audioRestored(now: Date()) {
-                        log("[silent-recovery] Audio restored on session-\(sessionID): flat episode \(String(format: "%.1f", summary.total))s total, \(summary.restarts) restart(s)")
-                    }
-                    lastSilentSampleCount = silentSampleCount
-                    silentStreakStart = nil
-                    silentDiagCaptured = false
                 }
+                // Episode summary: the fix-effectiveness metric. Total user-perceived gap
+                // (across any restarts) and how many restarts it took to end it.
+                if let summary = flatEpisode.audioRestored(now: Date()) {
+                    log("[silent-recovery] Audio restored on session-\(sessionID): flat episode \(String(format: "%.1f", summary.total))s total, \(summary.restarts) restart(s)")
+                }
+                lastSilentSampleCount = silentSampleCount
+                silentStreakStart = nil
+                silentDiagCaptured = false
             }
         }
     }
