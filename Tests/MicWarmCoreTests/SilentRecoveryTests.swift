@@ -109,6 +109,17 @@ final class SilentRecoveryTests: XCTestCase {
         XCTAssertEqual(summary?.restarts, 0)
     }
 
+    func testAudioBackBeforeAPendingRestartLandsWaitsForThatSession() {
+        // A non-silent buffer from the old session can arrive after the restart was queued.
+        var ep = SilentRecoveryEpisode()
+        XCTAssertEqual(silent(&ep, streakStart: 0, now: 4.0), 1)
+        XCTAssertNotNil(ep.audioRestored(now: at(4.1)))
+        // The queued restart is still in flight; no second one until it starts.
+        XCTAssertNil(silent(&ep, streakStart: 5, now: 10))
+        ep.sessionStarted()
+        XCTAssertEqual(silent(&ep, streakStart: 11, now: 15), 1)
+    }
+
     func testRestoredWithoutEpisodeReportsNothing() {
         var ep = SilentRecoveryEpisode()
         XCTAssertNil(ep.audioRestored(now: at(10)))

@@ -47,7 +47,8 @@ public struct SilentRecoveryEpisode {
         return attempts
     }
 
-    /// A replacement session started; the next silent streak may trigger another attempt.
+    /// Call when a session (re)start begins. Clears the pending flag, so the next silent
+    /// streak may trigger another attempt.
     public mutating func sessionStarted() {
         restartPending = false
     }

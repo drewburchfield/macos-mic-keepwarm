@@ -133,7 +133,8 @@ func describeDevice(_ deviceID: AudioDeviceID) -> String {
 }
 
 // The first input stream's active (virtual) format. The clearest in-process signal for the
-// Bluetooth profile in use: HFP/SCO presents as ~8k/16kHz mono, whereas other modes differ.
+// Bluetooth profile in use: HFP/SCO presents as low-rate mono (8k/16k/24kHz by codec; healthy
+// AirPods wideband voice is 24000 Hz).
 // Comparing this at flat-onset vs recovery tells us whether the SCO link was actually carrying audio.
 func inputStreamFormatDescription(_ deviceID: AudioDeviceID) -> String {
     guard deviceID > 0 else { return "no device" }
@@ -185,7 +186,7 @@ func logAllDevices(prefix: String) {
 // MARK: - Bluetooth/coreaudio unified-log capture
 
 // The macOS unified log holds the SCO/HFP/codec transitions that CoreAudio property values
-// can't show, but on this machine it rotates in tens of minutes. So we snapshot it into a
+// can't show, but on a busy system it rotates within tens of minutes. So we snapshot it into a
 // dedicated file the moment a flat signal is detected (and again on recovery), before it ages out.
 //
 // Written under a user-owned 0700 dir in ~/Library/Logs (not /tmp): a world-writable directory
@@ -230,29 +231,48 @@ func captureSystemAudioBTLog(reason: String, seconds: Int) {
         if timedOut {
             log("[bt-capture] log show exceeded 30s; terminating, writing partial :: \(reason)")
             proc.terminate()  // closes the pipe write end -> the read above hits EOF and returns
-            done.wait()
+            if done.wait(timeout: .now() + 5) == .timedOut {
+                // SIGTERM ignored: force it, and give up on the reader rather than wedge this queue.
+                kill(proc.processIdentifier, SIGKILL)
+                if done.wait(timeout: .now() + 5) == .timedOut {
+                    log("[bt-capture] log show did not exit after SIGKILL; skipping capture :: \(reason)")
+                    return
+                }
+            }
         }
         proc.waitUntilExit()
+        let status = proc.terminationStatus
+        if !timedOut && status != 0 {
+            log("[bt-capture] log show failed (status \(status)); its output is saved below :: \(reason)")
+        }
 
-        let header = "\n========== [\(logDateFormatter.string(from: Date()))] BT/coreaudio capture (last \(seconds)s\(timedOut ? ", TIMED OUT - partial" : "")) :: \(reason) ==========\n"
+        let header = "\n========== [\(logDateFormatter.string(from: Date()))] BT/coreaudio capture (last \(seconds)s\(timedOut ? ", TIMED OUT - partial" : ""), exit=\(status)) :: \(reason) ==========\n"
         let fm = FileManager.default
-        // 0700 dir owned by us means no other user can plant a symlink to redirect our writes.
-        try? fm.createDirectory(atPath: btLogDir, withIntermediateDirectories: true,
-                                attributes: [.posixPermissions: 0o700])
-        // Each capture is ~1.5-2MB; keep about the last ten (current file plus bt.log.1).
-        if LogRotation.rotateIfNeeded(btLogPath) {
-            log("[bt-capture] Rotated \(btLogPath) to bt.log.1")
+        do {
+            // 0700 dir owned by us means no other user can plant a symlink to redirect our writes.
+            try fm.createDirectory(atPath: btLogDir, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+            // Each capture is ~1.5-2MB; bt.log plus bt.log.1 keep roughly the last 5-10.
+            switch LogRotation.rotateIfNeeded(btLogPath) {
+            case .rotated: log("[bt-capture] Rotated \(btLogPath) to bt.log.1")
+            case .failed(let err): log("[bt-capture] WARNING: rotating \(btLogPath) failed: \(err)")
+            case .notNeeded: break
+            }
+            if !fm.fileExists(atPath: btLogPath),
+               !fm.createFile(atPath: btLogPath, contents: nil, attributes: [.posixPermissions: 0o600]) {
+                throw CocoaError(.fileWriteUnknown, userInfo: [NSFilePathErrorKey: btLogPath])
+            }
+            // The throwing FileHandle APIs: the legacy write(_:) raises an uncatchable
+            // Objective-C exception on ENOSPC, which would crash the daemon.
+            let fh = try FileHandle(forWritingTo: URL(fileURLWithPath: btLogPath))
+            defer { try? fh.close() }
+            try fh.seekToEnd()
+            try fh.write(contentsOf: Data(header.utf8))
+            try fh.write(contentsOf: data)
+            log("[bt-capture] Wrote \(data.count) bytes to \(btLogPath)\(timedOut ? " (partial)" : "") :: \(reason)")
+        } catch {
+            log("[bt-capture] FAILED to write \(btLogPath): \(error.localizedDescription) :: \(reason)")
         }
-        if !fm.fileExists(atPath: btLogPath) {
-            fm.createFile(atPath: btLogPath, contents: nil, attributes: [.posixPermissions: 0o600])
-        }
-        if let fh = FileHandle(forWritingAtPath: btLogPath) {
-            fh.seekToEndOfFile()
-            fh.write(header.data(using: .utf8) ?? Data())
-            fh.write(data)
-            try? fh.close()
-        }
-        log("[bt-capture] Wrote \(data.count) bytes to \(btLogPath)\(timedOut ? " (partial)" : "") :: \(reason)")
     }
 }
 
@@ -318,7 +338,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     // CoreAudio per-device listener callbacks. Isolated from both main and session queues.
     private let listenerQueue = DispatchQueue(label: "com.micwarm.listeners")
 
-    // --- Session state (confined to sessionQueue) ---
+    // --- Session state (written on sessionQueue; sessionID and the device fields are also read,
+    // unsynchronized, by sampleQueue and main for logging) ---
     private var session: AVCaptureSession?
     private var debounceWork: DispatchWorkItem?
     private let debounceSeconds: Double = 3.0
@@ -326,11 +347,11 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private var sessionID: UInt32 = 0
     private var currentDeviceID: AudioDeviceID = 0
     private var sessionStartTime: Date?
+
+    // --- Sample state (confined to sampleQueue; sleep/wake observers on main read sampleCount for logging) ---
+    private var sampleCount: UInt64 = 0
     private var consecutiveZeroSampleRestarts: Int = 0
     private var currentDeviceIsBluetooth: Bool = false
-
-    // --- Sample state (confined to sampleQueue) ---
-    private var sampleCount: UInt64 = 0
     private var lastSampleTime: Date?
     private var lastHeartbeatSampleCount: UInt64 = 0
     private var heartbeatTimer: DispatchSourceTimer?
@@ -392,10 +413,10 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         // avoiding the CAGuard deadlock that plagued the main-thread approach.
         if let old = session {
             let oldSid = sessionID
-            let oldSamples = sampleCount
+            let oldSamples = sampleQueue.sync { sampleCount }
             log("[session-\(oldSid)] Stopping old session (samples received: \(oldSamples))")
 
-            // Detach delegate first to stop sample callbacks immediately.
+            // Detach delegate first so no new sample callbacks are scheduled.
             for output in old.outputs {
                 if let audioOutput = output as? AVCaptureAudioDataOutput {
                     audioOutput.setSampleBufferDelegate(nil, queue: nil)
@@ -454,8 +475,10 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         let transport: UInt32 = currentDeviceID > 0
             ? (getAudioProperty(currentDeviceID, selector: kAudioDevicePropertyTransportType) ?? 0)
             : 0
-        currentDeviceIsBluetooth = transport == kAudioDeviceTransportTypeBluetooth
+        let isBluetooth = transport == kAudioDeviceTransportTypeBluetooth
             || transport == kAudioDeviceTransportTypeBluetoothLE
+        // Read by silent recovery on sampleQueue.
+        sampleQueue.sync { currentDeviceIsBluetooth = isBluetooth }
 
         log("[session-\(sid)] Opening device: \(device.localizedName) [id=\(currentDeviceID)]")
 
@@ -506,16 +529,13 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         // Check if audio buffer contains only silence (all zeros).
         // This detects "signal goes flat" where samples keep flowing but are empty.
         if let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) {
+            // The pointer is valid only for lengthAtOffset bytes (the first contiguous span).
             var length = 0
             var dataPointer: UnsafeMutablePointer<Int8>?
-            if CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: nil,
-                                           totalLengthOut: &length, dataPointerOut: &dataPointer) == noErr,
+            if CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: &length,
+                                           totalLengthOut: nil, dataPointerOut: &dataPointer) == noErr,
                let ptr = dataPointer, length > 0 {
-                let isSilent = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
-                    .withMemoryRebound(to: UInt8.self, capacity: length) { buf in
-                        for i in 0..<length { if buf[i] != 0 { return false } }
-                        return true
-                    }
+                let isSilent = UnsafeRawBufferPointer(start: ptr, count: length).allSatisfy { $0 == 0 }
                 if isSilent {
                     silentSampleCount += 1
                     if silentStreakStart == nil { silentStreakStart = Date() }
@@ -574,7 +594,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
         if attempt == maxAttempts {
             log("[silent-recovery] Attempt cap reached; further recovery waits for the link to come back on its own")
         }
-        sessionQueue.async { self.startSession_onSessionQueue() }
+        sessionQueue.async { self.restartOrRecover_onSessionQueue(reason: "silent-recovery") }
     }
 
     // MARK: - Heartbeat (runs on sampleQueue)
@@ -610,7 +630,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                     log("[session-\(sid)] *** HEARTBEAT: NO NEW SAMPLES in 5s (total: \(self.sampleCount), gap: \(String(format: "%.1f", gap))s)")
                     if gap > 15.0 {
                         log("[session-\(sid)] *** AUTO-RECOVERY: samples stopped for \(String(format: "%.0f", gap))s, restarting session")
-                        self.sessionQueue.async { self.startSession_onSessionQueue() }
+                        self.sessionQueue.async { self.restartOrRecover_onSessionQueue(reason: "samples stopped") }
                     }
                 } else if delta == 0 && self.sampleCount == 0 {
                     let age = self.sessionStartTime.map { Date().timeIntervalSince($0) } ?? 0
@@ -618,7 +638,7 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                     if age > 30.0 && running {
                         self.consecutiveZeroSampleRestarts += 1
                         log("[session-\(sid)] *** AUTO-RECOVERY: zero samples for \(String(format: "%.0f", age))s (consecutive: \(self.consecutiveZeroSampleRestarts)), restarting session")
-                        self.sessionQueue.async { self.startSession_onSessionQueue() }
+                        self.sessionQueue.async { self.restartOrRecover_onSessionQueue(reason: "zero samples") }
                     }
                 } else {
                     let silentDelta = self.silentSampleCount - self.lastSilentSampleCount
@@ -740,6 +760,8 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
                         deviceID, &addr, perDeviceListenerProc, listenerClientData)
                     if status == noErr {
                         perDeviceListeners.append(ListenerRegistration(deviceID: deviceID, address: addr))
+                    } else {
+                        log("[listeners] Add failed for \(perDeviceNames[deviceID] ?? "?") [id=\(deviceID)] selector=\(selector) status=\(status)")
                     }
                 }
             }
@@ -897,6 +919,16 @@ class MicKeeper: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
 
     // MARK: - Recovery
 
+    // startSession tears down the old session (and its heartbeat) before opening the device.
+    // If the open fails, e.g. mid Bluetooth handoff, nothing else would retry, so fall back to
+    // the recovery loop.
+    private func restartOrRecover_onSessionQueue(reason: String) {
+        if !startSession_onSessionQueue() {
+            log("[recovery] Restart failed (\(reason)); retrying until a device opens")
+            scheduleRecovery_onSessionQueue()
+        }
+    }
+
     private func scheduleRecovery_onSessionQueue() {
         sessionQueue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self else { return }
@@ -963,19 +995,23 @@ sigusr1Source.resume()
 
 // Cap the main log. launchd opens StandardOutPath once and hands us the fds, so the
 // process rotates the file itself: rename to mic-warm.log.1 and point stdout/stderr at a
-// fresh file. A run from a terminal (stdout not that file) is left alone.
+// fresh file. A run from a terminal (stdout not that file) is left alone, as is a plist that
+// still points at the old /tmp path (re-run install.sh to move it). Checked every 60s, so
+// the cap is soft by up to a minute of output.
 let mainLogPath = (btLogDir as NSString).appendingPathComponent("mic-warm.log")
 let logRotationTimer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
 logRotationTimer.schedule(deadline: .now() + 60, repeating: 60, leeway: .seconds(10))
 logRotationTimer.setEventHandler {
-    if LogRotation.rotateInheritedLog(mainLogPath) {
-        log("[log] Rotated previous log to \(mainLogPath).1 (cap \(LogRotation.maxBytes / 1024 / 1024)MB)")
+    switch LogRotation.rotateInheritedLog(mainLogPath) {
+    case .rotated: log("[log] Rotated previous log to \(mainLogPath).1 (cap \(LogRotation.maxBytes / 1024 / 1024)MB)")
+    case .failed(let err): log("[log] WARNING: log rotation failed: \(err)")
+    case .notNeeded: break
     }
 }
 logRotationTimer.resume()
 
 log("mic-warm starting (PID: \(ProcessInfo.processInfo.processIdentifier), version: 0.11.1)")
-log("[silent-recovery] Enabled: restart Bluetooth session after 4s of silent buffers (max 3 attempts/episode)")
+log("[silent-recovery] Enabled: restart Bluetooth session after \((0..<SilentRecoveryEpisode.maxAttempts).map { "\(Int(SilentRecoveryEpisode.threshold(forAttempt: $0)))s" }.joined(separator: "/")) of silent buffers (max \(SilentRecoveryEpisode.maxAttempts) attempts/episode)")
 log("[bt-capture] Flat-signal Bluetooth/coreaudio diagnostics enabled -> \(btLogPath)")
 log("[bt-capture] Manual trigger: kill -USR1 \(ProcessInfo.processInfo.processIdentifier)")
 keeper.start()
