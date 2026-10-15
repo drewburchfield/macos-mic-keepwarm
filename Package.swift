@@ -19,6 +19,16 @@ let package = Package(
                 .linkedFramework("CoreAudio"),
             ]
         ),
+        // The Mic Warm menu-bar app. scripts/build-app.sh wraps it in "Mic Warm.app".
+        .executableTarget(
+            name: "MicWarmApp",
+            dependencies: ["MicWarmCore"],
+            path: "Sources/MicWarmApp",
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("AVFoundation"),
+            ]
+        ),
         .testTarget(
             name: "MicWarmCoreTests",
             dependencies: ["MicWarmCore"],
