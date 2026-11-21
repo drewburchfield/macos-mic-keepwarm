@@ -19,19 +19,25 @@ RESET='\033[0m'
 
 # ── Build ────────────────────────────────────────────────────────
 
+# True when any source the mic-warm binary is built from is newer than $1.
+sources_newer_than() {
+    [ -n "$(find "$SCRIPT_DIR/Sources/MicWarm" "$SCRIPT_DIR/Sources/MicWarmEngine" "$SCRIPT_DIR/Sources/MicWarmCore" \
+        -name '*.swift' -newer "$1" -print -quit)" ]
+}
+
 build_if_needed() {
     local debug_bin="$SCRIPT_DIR/.build/debug/mic-warm"
     local release_bin
     # Prefer a current release binary (CI's universal build), fall back to a debug build.
     for release_bin in "$SCRIPT_DIR/.build/apple/Products/Release/mic-warm" \
                        "$SCRIPT_DIR/.build/out/Products/Release/mic-warm"; do
-        if [ -f "$release_bin" ] && [ ! "$SCRIPT_DIR/Sources/MicWarm/main.swift" -nt "$release_bin" ]; then
+        if [ -f "$release_bin" ] && ! sources_newer_than "$release_bin"; then
             BINARY="$release_bin"
             return
         fi
     done
 
-    if [ ! -f "$debug_bin" ] || [ "$SCRIPT_DIR/Sources/MicWarm/main.swift" -nt "$debug_bin" ]; then
+    if [ ! -f "$debug_bin" ] || sources_newer_than "$debug_bin"; then
         echo "Building mic-warm..."
         (cd "$SCRIPT_DIR" && swift build 2>&1) || {
             echo -e "${RED}Build failed${RESET}"
