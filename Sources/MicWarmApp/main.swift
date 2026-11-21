@@ -1,10 +1,13 @@
 import AppKit
 import MicWarmCore
+import MicWarmEngine
+import ServiceManagement
 
 // Mic Warm menu-bar app. Runs as an accessory (no Dock icon, LSUIElement in Info.plist).
 //
 // Arguments:
-//   --state <warm|recovering|paused|needs-access>   start in a preview state
+//   --state <warm|recovering|paused|needs-access>   start previewing that glyph (the engine still runs)
+//   --open-at-login <on|off>                        register or remove this copy as a login item and exit
 //   --render-glyphs <dir>                            write each state's glyph as PNG (1x, 2x) and exit
 
 func argument(after flag: String) -> String? {
@@ -41,23 +44,35 @@ func renderGlyphs(to dir: String) -> Int32 {
     }
 }
 
+// Registers or removes this copy of the app as a login item, then exits.
+if let value = argument(after: "--open-at-login") {
+    do {
+        if value == "on" { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        exit(0)
+    } catch {
+        FileHandle.standardError.write(Data("open-at-login: \(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+}
+
 if let dir = argument(after: "--render-glyphs") {
     exit(renderGlyphs(to: dir))
 }
 
-let initialState: WarmState
+var previewState: WarmState?
 if let raw = argument(after: "--state") {
     guard let s = WarmState(rawValue: raw) else {
         let names = WarmState.allCases.map(\.rawValue).joined(separator: ", ")
         FileHandle.standardError.write(Data("Unknown state \"\(raw)\". Use one of: \(names)\n".utf8))
         exit(2)
     }
-    initialState = s
-} else {
-    initialState = .warm
+    previewState = s
 }
 
+AppLog.install()
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
-let controller = StatusController(state: initialState)
+let model = AppModel()
+let controller = StatusController(model: model, preview: previewState)
+model.launch()
 app.run()

@@ -10,23 +10,32 @@ let package = Package(
             name: "MicWarmCore",
             path: "Sources/MicWarmCore"
         ),
-        .executableTarget(
-            name: "mic-warm",
+        // The capture engine (AVCaptureSession, CoreAudio listeners, recovery), shared by the
+        // CLI daemon and the app.
+        .target(
+            name: "MicWarmEngine",
             dependencies: ["MicWarmCore"],
-            path: "Sources/MicWarm",
+            path: "Sources/MicWarmEngine",
             linkerSettings: [
+                .linkedFramework("AppKit"),
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreAudio"),
             ]
         ),
+        .executableTarget(
+            name: "mic-warm",
+            dependencies: ["MicWarmCore", "MicWarmEngine"],
+            path: "Sources/MicWarm"
+        ),
         // The Mic Warm menu-bar app. scripts/build-app.sh wraps it in "Mic Warm.app".
         .executableTarget(
             name: "MicWarmApp",
-            dependencies: ["MicWarmCore"],
+            dependencies: ["MicWarmCore", "MicWarmEngine"],
             path: "Sources/MicWarmApp",
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("AVFoundation"),
+                .linkedFramework("ServiceManagement"),
             ]
         ),
         .testTarget(

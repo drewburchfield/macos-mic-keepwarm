@@ -6,16 +6,39 @@ The native menu-bar app (bundle id `com.drewburchfield.micwarm`, version 1.0.0).
 ## Build and run
 
 ```bash
+scripts/install-app.sh             # build, install in /Applications, launch
 scripts/build-app.sh               # .build/Mic Warm.app, native arch
 scripts/build-app.sh --universal   # arm64 + x86_64
-open ".build/Mic Warm.app" --args --state recovering
 ```
 
-`--state` takes `warm`, `recovering`, `paused`, or `needs-access`. The capture engine is not in
-the app yet, so the menu's Preview State submenu switches the glyph by hand.
+The app runs the same capture engine as the CLI (`Sources/MicWarmEngine`) and logs to
+`~/Library/Logs/mic-warm/app.log`, next to the CLI's `mic-warm.log` and the shared `bt.log`.
 
+## Living beside the command-line mic-warm
+
+The app and the CLI share one instance lock, so only one holds the mic. While the CLI's
+LaunchAgent (`com.user.keep-mic-warm`) is loaded, the app stands by with a dimmed glyph and
+leaves the mic alone. **Switch to Mic Warm App** in its menu disables the agent (it stays off
+across logins), stops the CLI, takes the lock, and turns on Open at Login.
+
+To go back, hold Option while opening the menu and pick **Switch Back to Command-Line
+mic-warm**. The app releases the mic, re-enables and starts the agent, and quits.
+
+## Menu
+
+- Header and detail: what the app is doing, with a status dot.
+- Pause / Resume: releases the mic and keeps it closed, across relaunches, until resumed.
+- Open at Login, Sound Settings…, About, Quit.
+- Hold Option for diagnostics: Preview State (shows any glyph without touching the engine),
+  Show Logs in Finder, and Switch Back to Command-Line mic-warm.
+
+`--state <warm|recovering|paused|needs-access>` at launch starts previewing that glyph.
 `"Mic Warm.app/Contents/MacOS/Mic Warm" --render-glyphs <dir>` writes each state's menu-bar
 glyph as PNG at 1x and 2x.
+
+Ad-hoc builds get a new code hash each time, so macOS asks for microphone access after each
+rebuild. `MIC_WARM_SIGN_IDENTITY` signs with a stable identity instead; `install-app.sh`
+picks the first Apple Development identity it finds.
 
 ## Icons
 

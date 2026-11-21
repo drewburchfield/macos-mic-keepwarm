@@ -4,7 +4,10 @@
 #   scripts/build-app.sh              native arch, release
 #   scripts/build-app.sh --universal  arm64 + x86_64, release
 #
-# Output: .build/Mic Warm.app, ad-hoc signed. Developer ID signing and notarization come later.
+# Output: .build/Mic Warm.app, ad-hoc signed unless MIC_WARM_SIGN_IDENTITY names a signing
+# identity. A stable identity (e.g. "Apple Development: ...") keeps the microphone permission
+# across rebuilds; ad-hoc builds get a new code hash each time, so macOS asks again.
+# Developer ID signing and notarization come later.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -26,5 +29,5 @@ cp App/Info.plist "$APP/Contents/Info.plist"
 cp App/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 plutil -lint "$APP/Contents/Info.plist" >/dev/null
 
-codesign --force --sign - "$APP"
+codesign --force --sign "${MIC_WARM_SIGN_IDENTITY:--}" "$APP"
 echo "Built $APP"
